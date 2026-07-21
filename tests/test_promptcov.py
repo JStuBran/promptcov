@@ -924,6 +924,94 @@ def test_check_cli_run_parity(tmp_path, capsys):
         main(["check", base_json])
 
 
+# ----------------------------- compare mode -----------------------------
+
+def _cmp_stub(model, verdicts):
+    return {"meta": {"schema_version": 2, "prompt_sha256": "p" * 64,
+                     "corpus_sha256": "c" * 64, "metric": "lexical",
+                     "model": model, "temperature": 1.0, "max_tokens": 64,
+                     "replicates": 2, "negate": False, "probes": False,
+                     "probe_n": 4, "probe_replicates": 3, "alpha": 0.05,
+                     "min_effect": 0.02, "correction": "bh", "q": 0.1,
+                     "exhaustive": False, "judge": False,
+                     "judge_model": None},
+            "segments": [{"id": f"S1.L{i + 1}", "kind": "leaf",
+                          "text": f"rule {i + 1}\n", "verdict": v}
+                         for i, v in enumerate(verdicts)]}
+
+
+def test_compare_matrix_and_preconditions():
+    from promptcov.check import CheckError
+    from promptcov.compare import compare_payloads
+    a = _cmp_stub("model-a", [st.LOAD_BEARING, st.NO_OBSERVED_EFFECT,
+                              st.INHERITED])
+    b = _cmp_stub("model-b", [st.NO_OBSERVED_EFFECT, st.NO_OBSERVED_EFFECT,
+                              st.LOAD_BEARING])
+    out = compare_payloads(a, b)
+    assert out["n_disagreements"] == 1
+    top = out["rows"][0]
+    assert top["disagreement"] and top["a"] == st.LOAD_BEARING
+    # INHERITED-vs-verdict is unknown, never a disagreement
+    unk = next(r for r in out["rows"] if r["id"] == "S1.L3")
+    assert unk["unknown"] and not unk["disagreement"]
+    assert "NOT comparable across models" in out["note"]
+    # same model on both sides is rejected
+    with pytest.raises(CheckError, match="two different models"):
+        compare_payloads(a, _cmp_stub("model-a", [st.LOAD_BEARING] * 3))
+    # prompt mismatch is rejected
+    import copy
+    b2 = copy.deepcopy(b)
+    b2["meta"]["prompt_sha256"] = "x" * 64
+    with pytest.raises(CheckError, match="prompt mismatch"):
+        compare_payloads(a, b2)
+    # config mismatch is rejected
+    b3 = copy.deepcopy(b)
+    b3["meta"]["replicates"] = 5
+    with pytest.raises(CheckError, match="config mismatch"):
+        compare_payloads(a, b3)
+
+
+def test_compare_cli_orchestration_offline(tmp_path):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    out = str(tmp_path / "cmp.html")
+    assert main(["compare", "--models", "mock/sim-a,mock/sim-b",
+                 "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--out", out, "--quiet",
+                 "--cache-dir", str(tmp_path / "cache")]) == 0
+    assert os.path.exists(out)
+    assert os.path.exists(str(tmp_path / "cmp-mock_sim-a.json"))
+    assert os.path.exists(str(tmp_path / "cmp-mock_sim-b.json"))
+    # identical simulated behavior → zero disagreements, but a full matrix
+    html = open(out).read()
+    assert "NOT" in html and "noise floor" in html
+
+
+def test_compare_cli_partial_failure_keeps_first_report(tmp_path,
+                                                        monkeypatch):
+    import promptcov.cli as cli_mod
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    real_provider = cli_mod._provider
+
+    def boom(name, model, *a, **kw):
+        if model == "mock/boom":
+            raise RuntimeError("provider exploded")
+        return real_provider(name, model, *a, **kw)
+
+    monkeypatch.setattr(cli_mod, "_provider", boom)
+    out = str(tmp_path / "cmp.html")
+    rc = main(["compare", "--models", "mock/sim-a,mock/boom",
+               "--prompt", prompt, "--corpus", corpus,
+               "--provider", "mock", "--out", out, "--quiet",
+               "--cache-dir", str(tmp_path / "cache")])
+    assert rc == 3
+    assert os.path.exists(str(tmp_path / "cmp-mock_sim-a.json"))
+    assert not os.path.exists(out)
+
+
 class _EitherOrProvider:
     """Behavior depends only on whether at least one of two rules survives:
     deleting either alone is inert, deleting both is catastrophic. This is

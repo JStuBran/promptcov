@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 from .engine import Config, Engine
@@ -62,7 +63,9 @@ def _provider(name: str, model: str, temperature: float, max_tokens: int,
               batch: bool = False):
     if name == "mock":
         from .providers import MockProvider
-        return MockProvider()
+        # the run-parser default model is an anthropic id; only an
+        # explicitly mock-flavored model re-namespaces the mock
+        return MockProvider(None if model == "claude-sonnet-4-6" else model)
     from .providers import AnthropicProvider
     return AnthropicProvider(model=model, temperature=temperature,
                              max_tokens=max_tokens, batch=batch)
@@ -143,6 +146,72 @@ def _check_run_candidate(baseline: dict, args) -> str:
         from .check import CheckError
         raise CheckError(f"--run analysis failed with exit code {rc}")
     return os.path.splitext(out)[0] + ".json"
+
+
+def _compare(ap, args) -> int:
+    from .check import EXIT_INFRA, CheckError, load_report
+    from .compare import compare_payloads, render_compare
+    try:
+        if args.models:
+            models = [m.strip() for m in args.models.split(",") if m.strip()]
+            if len(models) != 2:
+                ap.error("--models wants exactly two, comma-separated")
+            if args.reports:
+                ap.error("compare --models runs the analyses itself — "
+                         "drop the positional report arguments")
+            if not (args.prompt and args.corpus):
+                ap.error("compare --models needs --prompt and --corpus")
+            base = os.path.splitext(args.out)[0]
+            paths = []
+            for m in models:
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", m)
+                out = f"{base}-{safe}.html"
+                argv = ["run", "--prompt", args.prompt,
+                        "--corpus", args.corpus,
+                        "--provider", args.provider, "--model", m,
+                        "--out", out, "--cache-dir", args.cache_dir,
+                        "--replicates", str(args.replicates),
+                        "--pruned-out",
+                        f"{base}-{safe}.pruned.md"]
+                for flag in ("negate", "probes", "exhaustive", "quiet"):
+                    if getattr(args, flag):
+                        argv.append(f"--{flag}")
+                try:
+                    rc = main(argv)
+                except Exception as e:
+                    rc, err = 1, e
+                else:
+                    err = None
+                if rc != 0:
+                    done = ", ".join(paths) or "none"
+                    print(f"● compare: analysis for model {m!r} failed"
+                          f"{f' ({err})' if err else ''} — completed "
+                          f"reports kept: {done}", file=sys.stderr)
+                    return EXIT_INFRA
+                paths.append(os.path.splitext(out)[0] + ".json")
+            path_a, path_b = paths
+        else:
+            if len(args.reports) != 2:
+                ap.error("compare wants two report JSONs (or --models)")
+            path_a, path_b = args.reports
+        outcome = compare_payloads(load_report(path_a),
+                                   load_report(path_b))
+    except CheckError as e:
+        print(f"● compare: not comparable — {e}", file=sys.stderr)
+        return EXIT_INFRA
+    with open(args.out, "w") as fh:
+        fh.write(render_compare(outcome))
+    print(f"● {outcome['model_a']} vs {outcome['model_b']}: "
+          f"{outcome['n_disagreements']} disagreement(s) — "
+          f"{outcome['note']}", file=sys.stderr)
+    for r in outcome["rows"]:
+        if r["disagreement"]:
+            print(f"  ▸ {r['id']}  {r['a']} vs {r['b']}  "
+                  f"“{r['text'].strip()[:70]}”", file=sys.stderr)
+    print(f"● comparison report: {args.out}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(outcome, indent=1))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,6 +320,33 @@ def main(argv: list[str] | None = None) -> int:
                      help="corpus for --run")
     chk.add_argument("--cache-dir", default=".promptcov_cache")
 
+    cmp = sub.add_parser("compare", help="cross-model comparison: which "
+                         "rules are load-bearing on one model but dead on "
+                         "another (verdict-level; effect sizes are never "
+                         "compared across models)")
+    cmp.add_argument("reports", nargs="*",
+                     help="two report JSONs from runs of different models "
+                          "over the same prompt+corpus (omit with "
+                          "--models)")
+    cmp.add_argument("--models", default=None,
+                     help="comma-separated pair, e.g. "
+                          "'claude-sonnet-4-6,claude-haiku-4-5' — runs "
+                          "the analysis once per model, then compares")
+    cmp.add_argument("--prompt", default=None)
+    cmp.add_argument("--corpus", default=None)
+    cmp.add_argument("--provider", choices=["anthropic", "mock"],
+                     default="anthropic")
+    cmp.add_argument("--negate", action="store_true")
+    cmp.add_argument("--probes", action="store_true")
+    cmp.add_argument("--exhaustive", action="store_true")
+    cmp.add_argument("--replicates", type=int, default=3)
+    cmp.add_argument("--out", default="promptcov_compare.html",
+                     help="comparison report path; orchestration mode also "
+                          "writes <out-base>-<model>.html/json per model")
+    cmp.add_argument("--json", action="store_true")
+    cmp.add_argument("--quiet", action="store_true")
+    cmp.add_argument("--cache-dir", default=".promptcov_cache")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "segments":
@@ -274,6 +370,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "check":
         return _check(ap, args)
+
+    if args.cmd == "compare":
+        return _compare(ap, args)
 
     if args.cmd == "demo":
         here = os.path.join(os.path.dirname(__file__), "examples")

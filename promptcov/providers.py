@@ -198,8 +198,18 @@ _STATUSES = ["shipped", "out for delivery", "processing", "delivered"]
 
 
 class MockProvider:
-    """Simulates 'Aria' for CloudNest. See module docstring."""
+    """Simulates 'Aria' for CloudNest. See module docstring.
+
+    An explicit `model` gives the instance its own cache namespace and
+    meta identity — enough for offline cross-model plumbing tests (the
+    simulated behavior itself does not vary by model)."""
     name = "mock"
+    model = "mock/aria-sim"
+
+    def __init__(self, model: str | None = None):
+        if model and model != "mock/aria-sim":
+            self.model = model
+            self.name = f"mock:{model}"
 
     # ------------- read the (possibly ablated) system prompt -------------
     def _flags(self, sys: str) -> dict:
