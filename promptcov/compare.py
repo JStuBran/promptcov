@@ -17,10 +17,7 @@ from __future__ import annotations
 
 import json
 
-from . import stats as st
-from .check import PARITY_FIELDS, CheckError, _leaves
-
-_UNKNOWN = {st.INHERITED, st.NOT_TESTED, None}
+from .check import PARITY_FIELDS, CheckError, _UNKNOWN, _leaves
 
 # model identity must differ; sampling/config identity must match
 COMPARE_PARITY = tuple(f for f in PARITY_FIELDS if f != "model")

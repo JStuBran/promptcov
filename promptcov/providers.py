@@ -51,17 +51,7 @@ class AnthropicProvider:
             timeout=120.0)
 
     def _post(self, body: dict) -> dict:
-        delay = 2.0
-        for attempt in range(6):
-            r = self._client.post("/v1/messages", json=body)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 529):
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-            raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
-        raise RuntimeError("API retries exhausted")
+        return self._request("POST", "/v1/messages", body).json()
 
     @staticmethod
     def _messages(user) -> list[dict]:
