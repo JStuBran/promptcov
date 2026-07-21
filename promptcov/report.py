@@ -23,6 +23,8 @@ def _payload(res) -> dict:
             for name in ("deletion", "negation", "probe"):
                 tr = getattr(v, name)
                 item[name] = tr.summary() if tr else None
+            item["judge"] = v.judge
+            item["judged"] = v.judge is not None
             item["example"] = v.example
         segs.append(item)
 

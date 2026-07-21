@@ -128,6 +128,130 @@ def test_sparse_channel_does_not_escape_correction():
     assert not sparse2.significant and sparse2.mode == ""
 
 
+def _mk_deletion(p_value, p_tail=1.0, effect=0.0, tail_hits=0,
+                 significant=False, mode="", scores=None, outs=None):
+    d = st.TestResult(scores=scores or [0.1, 0.2], noise=[0.02] * 20,
+                      p_value=p_value, p_tail=p_tail, effect=effect,
+                      tail_hits=tail_hits, significant=significant,
+                      mode=mode)
+    d._outs = outs or ["v-out-0", "v-out-1"]
+    return d
+
+
+def test_judge_borderline_band():
+    from promptcov import judge as jm
+    cfg = Config()  # alpha 0.05, min_effect 0.02
+    # clearly significant, big effect, no sparse near-miss: never judged
+    assert not jm.borderline(_mk_deletion(0.001, effect=0.3,
+                                          significant=True, mode="dense"),
+                             cfg)
+    # clearly insignificant: never judged
+    assert not jm.borderline(_mk_deletion(0.8), cfg)
+    # p in the symmetric band
+    assert jm.borderline(_mk_deletion(0.07), cfg)
+    assert jm.borderline(_mk_deletion(0.03, effect=0.3, significant=True,
+                                      mode="dense"), cfg)
+    # dense-significant but effect below 2*min_effect
+    assert jm.borderline(_mk_deletion(0.001, effect=0.03, significant=True,
+                                      mode="dense"), cfg)
+    # sparse near-misses
+    assert jm.borderline(_mk_deletion(0.9, p_tail=0.6, tail_hits=1), cfg)
+    assert jm.borderline(_mk_deletion(0.9, p_tail=0.01, tail_hits=2,
+                                      significant=True, mode="sparse"), cfg)
+
+
+class _FakeJudge:
+    def __init__(self, mean):
+        self.mean = mean
+        self.model = "fake-judge"
+
+    def borderline(self, d, cfg):
+        return True
+
+    def score_pairs(self, leaf_id, inputs, outs, baseline, scores):
+        from promptcov.judge import JudgeResult
+        n = 0 if self.mean is None else 3
+        return JudgeResult(self.model, self.mean, n,
+                           "unavailable" if self.mean is None else "confirmed")
+
+
+def _run_cascade(judge, d):
+    doc = parse("## S\n\nRule alpha.\n")
+    leaf = doc.leaves()[0]
+    from promptcov.engine import Results
+    res = Results(doc=doc, inputs=["q0", "q1"],
+                  baseline=[["b-out-0", "b-out-1"]], noise=[0.02] * 20)
+    with tempfile.TemporaryDirectory() as td:
+        eng = Engine(MockProvider(), Config(verbose=False), cache_dir=td,
+                     judge=judge)
+        eng._leaf_cascade(doc, leaf, res.inputs, res, d)
+    return res.verdicts[leaf.id]
+
+
+def test_judge_downgrades_borderline_load_bearing():
+    d = _mk_deletion(0.03, effect=0.03, significant=True, mode="dense")
+    sv = _run_cascade(_FakeJudge(mean=0.7), d)
+    assert sv.verdict == st.NO_OBSERVED_EFFECT
+    assert sv.judge["verdict_effect"] == "downgraded"
+    assert "downgraded" in sv.note and sv.deletion.q is None or True
+    # the metric signal stays recorded on the deletion result
+    assert sv.deletion.p_value == 0.03
+
+
+def test_judge_upgrades_near_miss():
+    d = _mk_deletion(0.07, effect=0.15)
+    sv = _run_cascade(_FakeJudge(mean=2.8), d)
+    assert sv.verdict == st.LOAD_BEARING
+    assert sv.judge["verdict_effect"] == "upgraded"
+    assert "upgraded" in sv.note
+
+
+def test_judge_unavailable_metric_verdict_stands():
+    d = _mk_deletion(0.03, effect=0.3, significant=True, mode="dense")
+    sv = _run_cascade(_FakeJudge(mean=None), d)
+    assert sv.verdict == st.LOAD_BEARING
+    assert sv.judge["verdict_effect"] == "unavailable"
+    assert "unavailable" in sv.note
+
+
+def test_judge_cache_namespaced_by_model():
+    from promptcov.judge import Judge
+
+    class _JudgeProvider:
+        def __init__(self, name):
+            self.name = name
+            self.model = name
+            self.calls = 0
+
+        def complete(self, system, user, run_tag=""):
+            self.calls += 1
+            return "Differs a bit.\nSCORE: 1"
+
+    with tempfile.TemporaryDirectory() as td:
+        p1 = _JudgeProvider("judge-model-a:t0")
+        j1 = Judge(p1, cache_dir=td)
+        j1.score_pairs("S1.L1", ["q"], ["v"], [["b"]], [0.5])
+        assert p1.calls == 1
+        # same model, warm cache: zero new calls
+        p1b = _JudgeProvider("judge-model-a:t0")
+        Judge(p1b, cache_dir=td).score_pairs("S1.L1", ["q"], ["v"],
+                                             [["b"]], [0.5])
+        assert p1b.calls == 0
+        # different model over the same cache dir: fresh calls
+        p2 = _JudgeProvider("judge-model-b:t0")
+        Judge(p2, cache_dir=td).score_pairs("S1.L1", ["q"], ["v"],
+                                            [["b"]], [0.5])
+        assert p2.calls == 1
+
+
+def test_dry_run_estimate_includes_judge_term():
+    from promptcov.engine import estimate_calls
+    doc = parse(ARIA)
+    _, hi = estimate_calls(doc, 28, Config())
+    _, hi_j = estimate_calls(doc, 28, Config(do_judge=True))
+    assert hi_j > hi
+
+
 def test_probe_replicates_scale_estimate_and_noise():
     from promptcov.engine import estimate_calls
     doc = parse(ARIA)

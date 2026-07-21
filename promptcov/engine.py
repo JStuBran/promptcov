@@ -39,6 +39,7 @@ class Config:
     correction: str = "bh"             # bh | bonferroni | none
     q_level: float = 0.10              # FDR level for bh
     probe_replicates: int = 3
+    do_judge: bool = False
     rescue: bool = True
     verbose: bool = True
     concurrency: int = 8
@@ -64,6 +65,8 @@ def estimate_calls(doc: Doc, n_inputs: int, cfg: Config) -> tuple[int, int]:
         # per leaf: probe_replicates baseline sweeps + 1 variant sweep,
         # plus the one generation call
         leaf_worst += l * ((cfg.probe_replicates + 1) * cfg.probe_n) + l
+    if cfg.do_judge:
+        leaf_worst += l * min(6, n_inputs)   # judged pairs per borderline leaf
     floor = base + sections + verify
     ceil = base + sections + leaf_worst + verify
     if cfg.exhaustive:
@@ -127,10 +130,12 @@ def _example(tr: st.TestResult, inputs: list[str], outs: list[str],
 
 
 class Engine:
-    def __init__(self, provider, cfg: Config, cache_dir: str, metric=None):
+    def __init__(self, provider, cfg: Config, cache_dir: str, metric=None,
+                 judge=None):
         self.p = provider
         self.cfg = cfg
         self.metric = metric or LexicalMetric()
+        self.judge = judge
         self.runner = Runner(provider, cache_dir=cache_dir,
                              concurrency=cfg.concurrency)
 
@@ -225,6 +230,8 @@ class Engine:
             "alpha": cfg.alpha, "min_effect": cfg.min_effect,
             "correction": cfg.correction, "q": cfg.q_level,
             "n_tests": res.n_tests,
+            "judge": self.judge is not None,
+            "judge_model": self.judge.model if self.judge else None,
             "probe_replicates": cfg.probe_replicates,
             "exhaustive": cfg.exhaustive,
             "temperature": getattr(self.p, "temperature", None),
@@ -267,6 +274,44 @@ class Engine:
             d.mode = "sparse"
 
     def _leaf_cascade(self, doc: Doc, leaf: Segment, inputs: list[str],
+                      res: Results, d: st.TestResult):
+        jr = None
+        if self.judge is not None and self.judge.borderline(d, self.cfg):
+            from .judge import _DOWNGRADE_BELOW, _UPGRADE_AT
+            jr = self.judge.score_pairs(leaf.id, inputs, d._outs,
+                                        res.baseline, d.scores)
+            if jr.mean_score is not None:
+                if d.significant and jr.mean_score < _DOWNGRADE_BELOW:
+                    # judge saw at most stylistic drift: the borderline
+                    # metric signal stands recorded, the verdict does not
+                    jr.verdict_effect = "downgraded"
+                    d.significant, d.mode = False, ""
+                elif not d.significant and jr.mean_score >= _UPGRADE_AT:
+                    jr.verdict_effect = "upgraded"
+                    d.significant = True
+                    d.mode = "dense" if d.p_value <= d.p_tail else "sparse"
+        self._leaf_verdict(doc, leaf, inputs, res, d)
+        if jr is not None:
+            sv = res.verdicts[leaf.id]
+            sv.judge = jr.summary()
+            if jr.verdict_effect == "unavailable":
+                sentence = (f"Judge ({jr.model}) unavailable — metric "
+                            f"verdict stands.")
+            else:
+                reading = {"downgraded": "rated the drift stylistic",
+                           "upgraded": "rated the drift substantive",
+                           "confirmed": "concurred with the metric"
+                           }[jr.verdict_effect]
+                outcome = {"downgraded": " — borderline metric signal "
+                                         "recorded, verdict downgraded",
+                           "upgraded": " — near-miss metric signal upgraded",
+                           "confirmed": ""}[jr.verdict_effect]
+                sentence = (f"Judge ({jr.model}) {reading} (mean "
+                            f"{jr.mean_score:.2f}/3 over {jr.n_pairs} "
+                            f"pairs){outcome}.")
+            sv.note = f"{sv.note} {sentence}".strip()
+
+    def _leaf_verdict(self, doc: Doc, leaf: Segment, inputs: list[str],
                       res: Results, d: st.TestResult):
         cfg = self.cfg
         sv = st.SegmentVerdict(leaf.id, st.NOT_TESTED, deletion=d)

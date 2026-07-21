@@ -100,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--probe-replicates", type=int, default=3,
                      help="baseline replicates for the probe noise floor "
                           "(more = stronger UNEXERCISED verdicts)")
+    run.add_argument("--judge", action="store_true",
+                     help="LLM second opinion on borderline verdicts "
+                          "(reference-based 0-3 rubric, temperature 0)")
+    run.add_argument("--judge-model", default="claude-haiku-4-5",
+                     help="model for --judge; judging is high-volume, "
+                          "so a cheap model is the right default")
     run.add_argument("--min-effect", type=float, default=None,
                      help="minimum-effect gate; defaults to the selected "
                           "metric's calibrated value (0.02 for lexical)")
@@ -178,8 +184,12 @@ def main(argv: list[str] | None = None) -> int:
                  sparse_margin=spec.sparse_margin,
                  correction=args.correction, q_level=args.q,
                  probe_replicates=args.probe_replicates,
+                 do_judge=args.judge,
                  rescue=not args.no_rescue, verbose=not args.quiet,
                  concurrency=args.concurrency)
+    if args.judge and args.provider != "anthropic":
+        ap.error("--judge requires --provider anthropic (offline tests "
+                 "exercise the judge through injected doubles)")
 
     if args.dry_run:
         from .engine import estimate_calls
@@ -203,9 +213,17 @@ def main(argv: list[str] | None = None) -> int:
                              embedding_model=args.embedding_model,
                              embedding_api=args.embedding_api)
 
+    judge = None
+    if args.judge:
+        from .judge import Judge
+        from .providers import AnthropicProvider
+        judge = Judge(AnthropicProvider(model=args.judge_model,
+                                        temperature=0.0, max_tokens=400),
+                      cache_dir=args.cache_dir)
+
     engine = Engine(_provider(args.provider, args.model,
                               args.temperature, args.max_tokens), cfg,
-                    cache_dir=args.cache_dir, metric=metric)
+                    cache_dir=args.cache_dir, metric=metric, judge=judge)
     res = engine.run(prompt_text, inputs)
 
     html = render(res, title=os.path.basename(args.prompt))

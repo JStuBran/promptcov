@@ -186,5 +186,6 @@ class SegmentVerdict:
     deletion: TestResult | None = None
     negation: TestResult | None = None
     probe: TestResult | None = None
+    judge: dict | None = None          # judge signal, when the leaf was judged
     example: dict = field(default_factory=dict)   # {input, baseline, variant}
     note: str = ""
