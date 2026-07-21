@@ -31,13 +31,12 @@ verdicts under `--metric embedding`.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
-import threading
 from dataclasses import dataclass
 
 from .divergence import divergence
+from .runner import JsonlKV
 
 
 @dataclass(frozen=True)
@@ -82,68 +81,38 @@ def _cos_distance(u: list[float], v: list[float]) -> float:
     return round(min(1.0, max(0.0, 1.0 - dot / (nu * nv))), 6)
 
 
-class _EmbeddingCache:
-    """Append-only JSONL vector cache, mirroring Runner's output cache:
-    a killed run loses nothing already embedded, and API reruns are free."""
-
-    def __init__(self, cache_dir: str, model_label: str):
-        self.model_label = model_label
-        self.path = os.path.join(cache_dir, "embeddings.jsonl")
-        os.makedirs(cache_dir, exist_ok=True)
-        self._lock = threading.Lock()
-        self._mem: dict[str, list[float]] = {}
-        try:
-            with open(self.path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        self._mem[rec["k"]] = rec["v"]
-                    except Exception:
-                        continue  # torn tail write from a killed run
-        except FileNotFoundError:
-            pass
-
-    def _key(self, text: str) -> str:
-        return hashlib.sha256(
-            f"{self.model_label}\x00{text}".encode()).hexdigest()
-
-    def get(self, text: str) -> list[float] | None:
-        with self._lock:
-            return self._mem.get(self._key(text))
-
-    def put(self, text: str, vec: list[float]):
-        k = self._key(text)
-        with self._lock:
-            if k in self._mem:
-                return
-            self._mem[k] = vec
-            with open(self.path, "a") as fh:
-                fh.write(json.dumps({"k": k, "v": vec}) + "\n")
-
-
 class _EmbeddingMetricBase:
-    """Common caching/warm-up layer. Subclasses implement _embed_batch."""
+    """Common caching/warm-up layer. Subclasses implement _embed_batch.
+    The disk layer is the same append-only JsonlKV as the Runner output
+    cache — a killed run loses nothing embedded, API reruns are free."""
 
     spec = SPECS["embedding"]
     _BATCH = 128
+    embedding_api: str | None = None      # recorded in meta for check --run
+    embedding_model: str | None = None
 
     def __init__(self, model_label: str, cache_dir: str | None):
         self.name = f"embedding:{model_label}"
-        self._cache = (_EmbeddingCache(cache_dir, model_label)
-                       if cache_dir else None)
+        self._model_label = model_label
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            self._kv = JsonlKV(os.path.join(cache_dir, "embeddings.jsonl"))
+        else:
+            self._kv = None
         self._local: dict[str, list[float]] = {}
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         raise NotImplementedError
 
+    def _key(self, text: str) -> str:
+        return hashlib.sha256(
+            f"{self._model_label}\x00{text}".encode()).hexdigest()
+
     def _lookup(self, text: str) -> list[float] | None:
         if text in self._local:
             return self._local[text]
-        if self._cache:
-            vec = self._cache.get(text)
+        if self._kv:
+            vec = self._kv.get(self._key(text))
             if vec is not None:
                 self._local[text] = vec
                 return vec
@@ -151,8 +120,8 @@ class _EmbeddingMetricBase:
 
     def _store(self, text: str, vec: list[float]):
         self._local[text] = vec
-        if self._cache:
-            self._cache.put(text, vec)
+        if self._kv:
+            self._kv.put(self._key(text), vec)
 
     def warm(self, texts: list[str]):
         """Embed all cache-misses in batches — the engine calls this before
@@ -191,6 +160,8 @@ class LocalEmbeddingMetric(_EmbeddingMetricBase):
                 "or use --embedding-api voyage/openai for an API backend.")
         self._model = StaticModel.from_pretrained(model_id)
         super().__init__(model_id, cache_dir)
+        self.embedding_api = "local"
+        self.embedding_model = model_id
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         return [[float(x) for x in vec] for vec in self._model.encode(texts)]
@@ -222,23 +193,15 @@ class ApiEmbeddingMetric(_EmbeddingMetricBase):
                      "content-type": "application/json"},
             timeout=60.0)
         super().__init__(f"{api}:{self.model}", cache_dir)
+        self.embedding_api = api
+        self.embedding_model = self.model
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        import time
-        delay = 2.0
-        for _ in range(6):
-            r = self._client.post(self._url,
-                                  json={"model": self.model, "input": texts})
-            if r.status_code == 200:
-                data = sorted(r.json()["data"], key=lambda d: d["index"])
-                return [d["embedding"] for d in data]
-            if r.status_code in (429, 500, 502, 503, 529):
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-            raise RuntimeError(f"embeddings API {r.status_code}: "
-                               f"{r.text[:300]}")
-        raise RuntimeError("embeddings API retries exhausted")
+        from .providers import retry_request
+        r = retry_request(self._client, "POST", self._url,
+                          {"model": self.model, "input": texts})
+        data = sorted(r.json()["data"], key=lambda d: d["index"])
+        return [d["embedding"] for d in data]
 
 
 # ------------------------------- factory ---------------------------------

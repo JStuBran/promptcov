@@ -21,6 +21,23 @@ import re
 import time
 
 
+def retry_request(client, method: str, url: str, body: dict | None = None):
+    """Shared HTTP retry ladder: 6 attempts, exponential backoff capped at
+    30s, retrying the transient statuses. Used by every raw-HTTP surface
+    (Messages, Batches, embeddings) so backoff policy can't drift."""
+    delay = 2.0
+    for _ in range(6):
+        r = client.request(method, url, json=body)
+        if r.status_code == 200:
+            return r
+        if r.status_code in (429, 500, 502, 503, 529):
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+        raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
+    raise RuntimeError("API retries exhausted")
+
+
 # ============================== Anthropic ================================
 
 class AnthropicProvider:
@@ -69,8 +86,7 @@ class AnthropicProvider:
                         "cache_control": {"type": "ephemeral"}}],
             "messages": self._messages(user),
         })
-        return "".join(b.get("text", "") for b in data.get("content", [])
-                       if b.get("type") == "text")
+        return self._text(data.get("content", []))
 
     # --------------------- Message Batches (50% price) --------------------
     # The same completion params as complete(), submitted asynchronously.
@@ -79,17 +95,12 @@ class AnthropicProvider:
     # batches routinely outlive the 5-minute ephemeral window.
 
     def _request(self, method: str, url: str, body: dict | None = None):
-        delay = 2.0
-        for _ in range(6):
-            r = self._client.request(method, url, json=body)
-            if r.status_code == 200:
-                return r
-            if r.status_code in (429, 500, 502, 503, 529):
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-            raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
-        raise RuntimeError("API retries exhausted")
+        return retry_request(self._client, method, url, body)
+
+    @staticmethod
+    def _text(content: list) -> str:
+        return "".join(b.get("text", "") for b in content
+                       if b.get("type") == "text")
 
     def submit_batch(self, reqs: list[dict]) -> str:
         body = {"requests": [
@@ -125,9 +136,7 @@ class AnthropicProvider:
             rtype = result.get("type")
             if rtype == "succeeded":
                 content = result.get("message", {}).get("content", [])
-                text = "".join(b.get("text", "") for b in content
-                               if b.get("type") == "text")
-                yield cid, "succeeded", text
+                yield cid, "succeeded", self._text(content)
             elif rtype == "errored":
                 err = result.get("error", {})
                 etype = err.get("error", {}).get("type", err.get("type", ""))
@@ -142,8 +151,7 @@ class AnthropicProvider:
         data = self._post({"model": self.model, "max_tokens": 400,
                            "temperature": 0,
                            "messages": [{"role": "user", "content": prompt}]})
-        return "".join(b.get("text", "") for b in data.get("content", [])
-                       if b.get("type") == "text")
+        return self._text(data.get("content", []))
 
     def negate_rule(self, rule: str) -> str | None:
         out = self._small(

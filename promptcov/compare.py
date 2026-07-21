@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 
-from .check import PARITY_FIELDS, CheckError, _UNKNOWN, _leaves
+from .check import PARITY_FIELDS, CheckError, UNKNOWN_VERDICTS, leaves
 
 # model identity must differ; sampling/config identity must match
 COMPARE_PARITY = tuple(f for f in PARITY_FIELDS if f != "model")
@@ -48,7 +48,7 @@ def compare_payloads(a: dict, b: dict) -> dict:
             f"wants two different models (same-model diffing is "
             f"`promptcov check`)")
 
-    leaves_a, leaves_b = _leaves(a), _leaves(b)
+    leaves_a, leaves_b = leaves(a), leaves(b)
     if [x["id"] for x in leaves_a] != [x["id"] for x in leaves_b]:
         raise CheckError("segmentation differs despite identical prompt "
                          "hashes — reports were built by incompatible "
@@ -57,7 +57,7 @@ def compare_payloads(a: dict, b: dict) -> dict:
     rows = []
     for la, lb in zip(leaves_a, leaves_b):
         va, vb = la.get("verdict"), lb.get("verdict")
-        known = va not in _UNKNOWN and vb not in _UNKNOWN
+        known = va not in UNKNOWN_VERDICTS and vb not in UNKNOWN_VERDICTS
         rows.append({"id": la["id"], "text": la["text"],
                      "a": va, "b": vb,
                      "unknown": not known,

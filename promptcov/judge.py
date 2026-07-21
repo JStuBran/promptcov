@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from . import stats as st
 from .runner import Runner
 
 DEFAULT_JUDGE_MODEL = "claude-haiku-4-5"
+MAX_PAIRS = 6                  # judged pairs per borderline leaf
 
 _SCORE_RE = re.compile(r"SCORE:\s*([0-3])")
 
@@ -91,8 +93,7 @@ class Judge:
     config, so swapping --judge-model on a warm cache triggers fresh
     judge calls instead of silently reusing another model's scores."""
 
-    def __init__(self, provider, cache_dir: str, max_pairs: int = 6):
-        self.provider = provider
+    def __init__(self, provider, cache_dir: str, max_pairs: int = MAX_PAIRS):
         self.model = getattr(provider, "model", provider.name)
         self.runner = Runner(provider, cache_dir=cache_dir, concurrency=4)
         self.max_pairs = max_pairs
@@ -100,26 +101,43 @@ class Judge:
     def borderline(self, d: st.TestResult, cfg) -> bool:
         return borderline(d, cfg)
 
-    def score_pairs(self, leaf_id: str, inputs: list[str],
+    def score_pairs(self, leaf_id: str, inputs: list,
                     variant_outs: list[str], baseline: list[list[str]],
-                    scores: list[float]) -> JudgeResult:
+                    scores: list[float],
+                    significant: bool = False) -> JudgeResult:
+        """Score the top-K most-divergent pairs and return the FINAL
+        verdict_effect — the rubric thresholds live here, next to the
+        rubric, not in the engine."""
         idx = sorted(range(len(inputs)), key=lambda i: -scores[i])
         idx = idx[:min(self.max_pairs, len(idx))]
+        # swap decisions are drawn sequentially (seeded, deterministic)
+        # BEFORE the parallel fan-out
         rng = random.Random(f"judge|{leaf_id}")
-        vals: list[int] = []
-        for i in idx:
+        swaps = {i: rng.random() < 0.5 for i in idx}
+
+        def one(i: int) -> int | None:
             a, b = baseline[0][i], variant_outs[i]
-            if rng.random() < 0.5:
+            if swaps[i]:
                 a, b = b, a
+            u = inputs[i]
+            user_msg = u if isinstance(u, str) else u.final_user
             try:
-                out = self.runner.one("", _pair_prompt(inputs[i], a, b),
+                out = self.runner.one("", _pair_prompt(user_msg, a, b),
                                       f"judge-{leaf_id}-{i}")
             except Exception:
-                continue
+                return None
             m = _SCORE_RE.findall(out)
-            if m:
-                vals.append(int(m[-1]))
+            return int(m[-1]) if m else None
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            vals = [v for v in ex.map(one, idx) if v is not None]
         if not vals:
             return JudgeResult(self.model, None, 0, "unavailable")
         mean = sum(vals) / len(vals)
-        return JudgeResult(self.model, mean, len(vals), "confirmed")
+        if significant and mean < _DOWNGRADE_BELOW:
+            effect = "downgraded"
+        elif not significant and mean >= _UPGRADE_AT:
+            effect = "upgraded"
+        else:
+            effect = "confirmed"
+        return JudgeResult(self.model, mean, len(vals), effect)

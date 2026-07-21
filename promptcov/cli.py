@@ -15,6 +15,8 @@ import sys
 from .engine import Config, Engine
 from .report import render
 
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
 
 def _load_corpus(path: str, max_inputs: int | None) -> list:
     """Rows: {"input": str} or a plain line (single-turn, stays a plain
@@ -40,8 +42,7 @@ def _load_corpus(path: str, max_inputs: int | None) -> list:
                 continue
             if isinstance(obj, dict):
                 if "messages" in obj:
-                    err = validate_messages(obj["messages"],
-                                            f"{path}:{lineno}")
+                    err = validate_messages(obj["messages"])
                     if err:
                         raise SystemExit(f"{path}:{lineno}: {err}")
                     inputs.append(Trace.from_messages(obj["messages"]))
@@ -65,7 +66,7 @@ def _provider(name: str, model: str, temperature: float, max_tokens: int,
         from .providers import MockProvider
         # the run-parser default model is an anthropic id; only an
         # explicitly mock-flavored model re-namespaces the mock
-        return MockProvider(None if model == "claude-sonnet-4-6" else model)
+        return MockProvider(None if model == DEFAULT_MODEL else model)
     from .providers import AnthropicProvider
     return AnthropicProvider(model=model, temperature=temperature,
                              max_tokens=max_tokens, batch=batch)
@@ -122,15 +123,14 @@ def _check_run_candidate(baseline: dict, args) -> str:
             "--min-effect", str(m["min_effect"]),
             "--correction", str(m["correction"]),
             "--q", str(m["q"])]
-    parts = str(m["metric"]).split(":")
-    argv += ["--metric", parts[0]]
-    if parts[0] == "embedding" and len(parts) > 1:
-        if parts[1] in ("voyage", "openai"):
-            argv += ["--embedding-api", parts[1]]
-            if len(parts) > 2:
-                argv += ["--embedding-model", ":".join(parts[2:])]
-        else:
-            argv += ["--embedding-model", ":".join(parts[1:])]
+    # metric identity is read from first-class meta fields — never
+    # reverse-parsed from the human-facing metric label
+    api = m.get("embedding_api")
+    argv += ["--metric", "embedding" if api else "lexical"]
+    if api:
+        argv += ["--embedding-api", api]
+        if m.get("embedding_model"):
+            argv += ["--embedding-model", str(m["embedding_model"])]
     if m.get("temperature") is not None:
         argv += ["--temperature", str(m["temperature"])]
     if m.get("max_tokens") is not None:
@@ -224,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--corpus", required=True)
     run.add_argument("--provider", choices=["anthropic", "mock"],
                      default="anthropic")
-    run.add_argument("--model", default="claude-sonnet-4-6")
+    run.add_argument("--model", default=DEFAULT_MODEL)
     run.add_argument("--out", default="promptcov_report.html")
     run.add_argument("--pruned-out", default=None,
                      help="where to write the verified pruned prompt")

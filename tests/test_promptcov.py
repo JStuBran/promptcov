@@ -161,6 +161,8 @@ def test_judge_borderline_band():
 
 
 class _FakeJudge:
+    """Mirrors Judge's decision contract with a scripted mean score."""
+
     def __init__(self, mean):
         self.mean = mean
         self.model = "fake-judge"
@@ -168,11 +170,19 @@ class _FakeJudge:
     def borderline(self, d, cfg):
         return True
 
-    def score_pairs(self, leaf_id, inputs, outs, baseline, scores):
-        from promptcov.judge import JudgeResult
-        n = 0 if self.mean is None else 3
-        return JudgeResult(self.model, self.mean, n,
-                           "unavailable" if self.mean is None else "confirmed")
+    def score_pairs(self, leaf_id, inputs, outs, baseline, scores,
+                    significant=False):
+        from promptcov.judge import (_DOWNGRADE_BELOW, _UPGRADE_AT,
+                                     JudgeResult)
+        if self.mean is None:
+            return JudgeResult(self.model, None, 0, "unavailable")
+        if significant and self.mean < _DOWNGRADE_BELOW:
+            effect = "downgraded"
+        elif not significant and self.mean >= _UPGRADE_AT:
+            effect = "upgraded"
+        else:
+            effect = "confirmed"
+        return JudgeResult(self.model, self.mean, 3, effect)
 
 
 def _run_cascade(judge, d):
@@ -610,20 +620,26 @@ def test_batch_resume_from_manifest(monkeypatch):
         def poll_batch(self, bid):
             raise KeyboardInterrupt
 
+    from promptcov.trace import Trace
+    trace = Trace.from_messages([{"role": "user", "content": "q1"},
+                                 {"role": "assistant", "content": "a1"},
+                                 {"role": "user", "content": "q2"}])
     with tempfile.TemporaryDirectory() as td:
         store = {}
         killed = _KilledMidPoll(store)
         r1 = Runner(killed, cache_dir=td)
         r1.fingerprint = {"prompt_sha256": "aaa", "corpus_sha256": "bbb"}
         with pytest.raises(KeyboardInterrupt):
-            r1.batch_group([("sys", ["u1", "u2"], "t0")])
+            r1.batch_group([("sys", ["u1", "u2", trace], "t0")])
         assert killed.submits == 1
-        # rerun: same fingerprint, same store — resumes, zero resubmission
+        # rerun: same fingerprint, same store — resumes, zero resubmission;
+        # the Trace row round-trips through the manifest faithfully
         fake2 = _FakeBatchProvider(store)
         r2 = Runner(fake2, cache_dir=td)
         r2.fingerprint = {"prompt_sha256": "aaa", "corpus_sha256": "bbb"}
-        outs = r2.batch_group([("sys", ["u1", "u2"], "t0")])
-        assert fake2.submits == 0 and len(outs[0]) == 2
+        outs = r2.batch_group([("sys", ["u1", "u2", trace], "t0")])
+        assert fake2.submits == 0 and len(outs[0]) == 3
+        assert all(o for o in outs[0])
 
 
 def test_batch_discards_stale_manifest(monkeypatch):

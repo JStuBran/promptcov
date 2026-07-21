@@ -25,13 +25,19 @@ leaves nothing to regenerate).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+
+def canonical_json(obj) -> str:
+    """The one canonical serialization: cache keys and corpus hashes both
+    depend on these exact kwargs staying identical."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
 
 
 @dataclass(frozen=True)
 class Trace:
     messages: tuple[tuple[str, str], ...]    # ((role, content), ...)
-    _canonical: str = field(default="", compare=False)
 
     @staticmethod
     def from_messages(msgs: list[dict]) -> "Trace":
@@ -39,9 +45,8 @@ class Trace:
 
     @property
     def canonical(self) -> str:
-        return json.dumps(
-            [{"content": c, "role": r} for r, c in self.messages],
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return canonical_json(
+            [{"content": c, "role": r} for r, c in self.messages])
 
     @property
     def final_user(self) -> str:
@@ -51,7 +56,7 @@ class Trace:
         return self.canonical
 
 
-def validate_messages(msgs, where: str) -> list[str] | None:
+def validate_messages(msgs) -> str | None:
     """Returns None when valid, else the error text (caller prefixes the
     file:line location)."""
     if not isinstance(msgs, list) or not msgs:

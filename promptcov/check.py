@@ -20,11 +20,11 @@ Exit codes (argparse owns 2, so policy avoids it):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 
 from . import stats as st
+from .engine import sha256_text
 
 EXIT_PASS, EXIT_POLICY, EXIT_INFRA = 0, 1, 3
 
@@ -36,7 +36,7 @@ PARITY_FIELDS = ("metric", "model", "temperature", "max_tokens",
                  "probe_replicates", "alpha", "min_effect", "correction",
                  "q", "exhaustive", "judge", "judge_model")
 
-_UNKNOWN = {st.INHERITED, st.NOT_TESTED, None}
+UNKNOWN_VERDICTS = {st.INHERITED, st.NOT_TESTED, None}
 
 
 class CheckError(Exception):
@@ -63,13 +63,13 @@ def load_report(path: str) -> dict:
     return payload
 
 
-def _leaves(payload: dict) -> list[dict]:
+def leaves(payload: dict) -> list[dict]:
     return [s for s in payload["segments"] if s.get("kind") == "leaf"]
 
 
-def _by_text(leaves: list[dict]) -> dict[str, list[dict]]:
+def _by_text(items: list[dict]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
-    for leaf in leaves:
+    for leaf in items:
         out.setdefault(leaf["text"], []).append(leaf)
     return out
 
@@ -93,8 +93,7 @@ def check_preconditions(baseline: dict, candidate: dict,
     if prompt_path is not None:
         try:
             with open(prompt_path) as fh:
-                actual = hashlib.sha256(
-                    fh.read().encode("utf-8")).hexdigest()
+                actual = sha256_text(fh.read())
         except FileNotFoundError:
             raise CheckError(f"--prompt file not found: {prompt_path}")
         if actual != cm["prompt_sha256"]:
@@ -110,8 +109,8 @@ def compare_reports(baseline: dict, candidate: dict, strict: bool = False,
     """Returns (exit_code, machine-readable outcome)."""
     check_preconditions(baseline, candidate, prompt_path)
 
-    base_by_text = _by_text(_leaves(baseline))
-    cand_by_text = _by_text(_leaves(candidate))
+    base_by_text = _by_text(leaves(baseline))
+    cand_by_text = _by_text(leaves(candidate))
 
     regressions, unknown, resolution_changes = [], [], []
     for text, occurrences in base_by_text.items():
@@ -123,14 +122,14 @@ def compare_reports(baseline: dict, candidate: dict, strict: bool = False,
                 eff = ((o.get("deletion") or {}).get("effect"))
                 regressions.append({"id": o["id"], "text": text,
                                     "baseline_effect": eff})
-            elif all(v in _UNKNOWN for v in verdicts):
+            elif all(v in UNKNOWN_VERDICTS for v in verdicts):
                 unknown.append({"id": occurrences[0]["id"], "text": text,
                                 "side": "baseline",
                                 "verdict": verdicts[0]})
         else:
             cand_vs = [o.get("verdict") for o in cand_by_text[text]]
             b, c = verdicts[0], cand_vs[0]
-            if (b in _UNKNOWN) != (c in _UNKNOWN):
+            if (b in UNKNOWN_VERDICTS) != (c in UNKNOWN_VERDICTS):
                 resolution_changes.append(
                     {"text": text, "baseline": b, "candidate": c})
 
@@ -181,6 +180,9 @@ def render_outcome(outcome: dict, out=sys.stderr):
     for nu in outcome["new_unmatched"]:
         p(f"  · unmatched new text ({nu['verdict']}): "
           f"“{nu['text'].strip()[:80]}” — unknown, not gated")
+    for u in outcome["unknown"]:
+        p(f"  · deleted rule with unknown baseline verdict "
+          f"({u['verdict']}): “{u['text'].strip()[:60]}” — not gated")
     for rc in outcome["resolution_changes"]:
         p(f"  · resolution change (not a regression): "
           f"{rc['baseline']} → {rc['candidate']}  "

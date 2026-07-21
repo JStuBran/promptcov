@@ -66,7 +66,8 @@ def estimate_calls(doc: Doc, n_inputs: int, cfg: Config) -> tuple[int, int]:
         # plus the one generation call
         leaf_worst += l * ((cfg.probe_replicates + 1) * cfg.probe_n) + l
     if cfg.do_judge:
-        leaf_worst += l * min(6, n_inputs)   # judged pairs per borderline leaf
+        from .judge import MAX_PAIRS
+        leaf_worst += l * min(MAX_PAIRS, n_inputs)
     floor = base + sections + verify
     ceil = base + sections + leaf_worst + verify
     if cfg.exhaustive:
@@ -105,7 +106,7 @@ class Results:
 SCHEMA_VERSION = 2
 
 
-def _sha256_text(text: str) -> str:
+def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -113,10 +114,9 @@ def corpus_sha256(inputs: list) -> str:
     """Content hash of the corpus, canonicalized so key order and
     whitespace in the source file can never change the identity. Trace
     rows contribute their canonical serialization."""
-    canon = json.dumps(
-        [x if isinstance(x, str) else x.canonical for x in inputs],
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return _sha256_text(canon)
+    from .trace import canonical_json
+    return sha256_text(canonical_json(
+        [x if isinstance(x, str) else x.canonical for x in inputs]))
 
 
 def _log(cfg: Config, msg: str):
@@ -175,7 +175,7 @@ class Engine:
         doc = parse(prompt_text)
         # batch-resume identity: a manifest entry only resumes when it was
         # submitted for this exact prompt + corpus
-        self.runner.fingerprint = {"prompt_sha256": _sha256_text(prompt_text),
+        self.runner.fingerprint = {"prompt_sha256": sha256_text(prompt_text),
                                    "corpus_sha256": corpus_sha256(inputs)}
         res = Results(doc=doc, inputs=inputs)
         leaves = doc.leaves()
@@ -254,9 +254,11 @@ class Engine:
             # comparability contract: everything `check`/`compare` need to
             # validate that two reports are talking about the same run shape
             "schema_version": SCHEMA_VERSION,
-            "prompt_sha256": _sha256_text(prompt_text),
+            "prompt_sha256": sha256_text(prompt_text),
             "corpus_sha256": corpus_sha256(inputs),
             "metric": self.metric.name,
+            "embedding_api": getattr(self.metric, "embedding_api", None),
+            "embedding_model": getattr(self.metric, "embedding_model", None),
             "provider": self.p.name,
             "model": getattr(self.p, "model", "mock/aria-sim"),
             "inputs": len(inputs),
@@ -308,19 +310,16 @@ class Engine:
                       res: Results, d: st.TestResult):
         jr = None
         if self.judge is not None and self.judge.borderline(d, self.cfg):
-            from .judge import _DOWNGRADE_BELOW, _UPGRADE_AT
             jr = self.judge.score_pairs(leaf.id, inputs, d._outs,
-                                        res.baseline, d.scores)
-            if jr.mean_score is not None:
-                if d.significant and jr.mean_score < _DOWNGRADE_BELOW:
-                    # judge saw at most stylistic drift: the borderline
-                    # metric signal stands recorded, the verdict does not
-                    jr.verdict_effect = "downgraded"
-                    d.significant, d.mode = False, ""
-                elif not d.significant and jr.mean_score >= _UPGRADE_AT:
-                    jr.verdict_effect = "upgraded"
-                    d.significant = True
-                    d.mode = "dense" if d.p_value <= d.p_tail else "sparse"
+                                        res.baseline, d.scores,
+                                        significant=d.significant)
+            if jr.verdict_effect == "downgraded":
+                # judge saw at most stylistic drift: the borderline metric
+                # signal stays recorded, the verdict does not
+                d.significant, d.mode = False, ""
+            elif jr.verdict_effect == "upgraded":
+                d.significant = True
+                d.mode = "dense" if d.p_value <= d.p_tail else "sparse"
         self._leaf_verdict(doc, leaf, inputs, res, d)
         if jr is not None:
             sv = res.verdicts[leaf.id]
