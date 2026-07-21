@@ -91,6 +91,15 @@ def main(argv: list[str] | None = None) -> int:
                      help="local = model2vec via promptcov[embeddings]; "
                           "voyage/openai need the matching *_API_KEY")
     run.add_argument("--alpha", type=float, default=0.05)
+    run.add_argument("--correction", choices=["bh", "bonferroni", "none"],
+                     default="bh",
+                     help="multiple-comparisons correction over the leaf "
+                          "deletion family (default: Benjamini-Hochberg)")
+    run.add_argument("--q", type=float, default=0.10,
+                     help="FDR level for --correction bh")
+    run.add_argument("--probe-replicates", type=int, default=3,
+                     help="baseline replicates for the probe noise floor "
+                          "(more = stronger UNEXERCISED verdicts)")
     run.add_argument("--min-effect", type=float, default=None,
                      help="minimum-effect gate; defaults to the selected "
                           "metric's calibrated value (0.02 for lexical)")
@@ -167,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
                  exhaustive=args.exhaustive,
                  alpha=args.alpha, min_effect=min_effect,
                  sparse_margin=spec.sparse_margin,
+                 correction=args.correction, q_level=args.q,
+                 probe_replicates=args.probe_replicates,
                  rescue=not args.no_rescue, verbose=not args.quiet,
                  concurrency=args.concurrency)
 

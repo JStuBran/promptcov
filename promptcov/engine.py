@@ -36,6 +36,9 @@ class Config:
     alpha: float = st.ALPHA
     min_effect: float = st.MIN_EFFECT
     sparse_margin: float = 0.01
+    correction: str = "bh"             # bh | bonferroni | none
+    q_level: float = 0.10              # FDR level for bh
+    probe_replicates: int = 3
     rescue: bool = True
     verbose: bool = True
     concurrency: int = 8
@@ -58,7 +61,9 @@ def estimate_calls(doc: Doc, n_inputs: int, cfg: Config) -> tuple[int, int]:
     if cfg.do_negate:
         leaf_worst += l * n_inputs + l   # inversion runs + generation calls
     if cfg.do_probes:
-        leaf_worst += l * (3 * cfg.probe_n) + l   # probe runs + generation
+        # per leaf: probe_replicates baseline sweeps + 1 variant sweep,
+        # plus the one generation call
+        leaf_worst += l * ((cfg.probe_replicates + 1) * cfg.probe_n) + l
     floor = base + sections + verify
     ceil = base + sections + leaf_worst + verify
     if cfg.exhaustive:
@@ -69,6 +74,7 @@ def estimate_calls(doc: Doc, n_inputs: int, cfg: Config) -> tuple[int, int]:
 @dataclass
 class Results:
     doc: Doc | None = None
+    n_tests: int = 0                   # size of the corrected leaf family
     inputs: list[str] = field(default_factory=list)
     baseline: list[list[str]] = field(default_factory=list)   # [rep][input]
     noise: list[float] = field(default_factory=list)
@@ -162,13 +168,15 @@ class Engine:
         _log(cfg, f"● noise floor: median {med:.3f}, p95 {p95:.3f} "
                   f"(anything below this is weather, not signal)")
 
-        # 2 — section-level bisection -----------------------------------
+        # 2 — section-level bisection: collect the leaf frontier --------
+        # The recursion gate stays on RAW p — it is a search heuristic, not
+        # a reported claim, and a section holding contradictory rules can
+        # cancel to near-zero mean effect while its children are
+        # individually load-bearing.
+        frontier: list[tuple[Segment, st.TestResult]] = []
         for sec in doc.sections:
             tr = self._test_deletion(doc, {sec.id}, inputs, res)
             res.section_tests[sec.id] = tr
-            # recurse on ANY statistical signal (p alone counts): a section
-            # holding contradictory rules can cancel to near-zero mean effect
-            # while its children are individually load-bearing.
             signal = tr.significant or tr.p_value < cfg.alpha
             recurse = signal or cfg.exhaustive
             verdict_word = ("EFFECT → recursing" if signal else
@@ -179,13 +187,24 @@ class Engine:
                       f"— {verdict_word}")
             if recurse:
                 for leaf in sec.children:
-                    self._test_leaf(doc, leaf, inputs, res)
+                    d = self._test_deletion(doc, {leaf.id}, inputs, res)
+                    frontier.append((leaf, d))
             else:
                 for leaf in sec.children:
                     res.verdicts[leaf.id] = st.SegmentVerdict(
                         leaf.id, st.INHERITED, deletion=None,
                         note="Whole section deleted with no observed "
                              "effect; leaf not tested individually.")
+
+        # 2b — correct the deletion family, then decide + cascade -------
+        res.n_tests = len(frontier)
+        qs = st.adjust_pvalues([st.deciding_p(d) for _, d in frontier],
+                               cfg.correction)
+        for (leaf, d), qv in zip(frontier, qs):
+            d.q = qv
+            if cfg.correction != "none":
+                self._apply_corrected_decision(d, qv)
+            self._leaf_cascade(doc, leaf, inputs, res, d)
 
         # 3 — prune + verify --------------------------------------------
         self._prune_and_verify(doc, inputs, res)
@@ -204,6 +223,9 @@ class Engine:
             "negate": cfg.do_negate, "probes": cfg.do_probes,
             "probe_n": cfg.probe_n,
             "alpha": cfg.alpha, "min_effect": cfg.min_effect,
+            "correction": cfg.correction, "q": cfg.q_level,
+            "n_tests": res.n_tests,
+            "probe_replicates": cfg.probe_replicates,
             "exhaustive": cfg.exhaustive,
             "temperature": getattr(self.p, "temperature", None),
             "max_tokens": getattr(self.p, "max_tokens", None),
@@ -227,10 +249,26 @@ class Engine:
         tr._outs = outs  # stash for example extraction
         return tr
 
-    def _test_leaf(self, doc: Doc, leaf: Segment, inputs: list[str],
-                   res: Results):
+    def _apply_corrected_decision(self, d: st.TestResult, qv: float):
+        """Re-decide a leaf deletion under the multiplicity-adjusted
+        deciding p. The channel gates mirror evaluate(): dense needs the
+        minimum-effect bar, sparse needs measured noise and >= 2 hits."""
         cfg = self.cfg
-        d = self._test_deletion(doc, {leaf.id}, inputs, res)
+        thresh = cfg.q_level if cfg.correction == "bh" else cfg.alpha
+        dense_ok = d.effect > cfg.min_effect
+        sparse_ok = bool(d.noise) and d.tail_hits >= 2
+        sig = qv < thresh and (dense_ok or sparse_ok)
+        d.significant = sig
+        if not sig:
+            d.mode = ""
+        elif dense_ok and (d.p_value <= d.p_tail or not sparse_ok):
+            d.mode = "dense"
+        else:
+            d.mode = "sparse"
+
+    def _leaf_cascade(self, doc: Doc, leaf: Segment, inputs: list[str],
+                      res: Results, d: st.TestResult):
+        cfg = self.cfg
         sv = st.SegmentVerdict(leaf.id, st.NOT_TESTED, deletion=d)
         if d.significant:
             sv.verdict = st.LOAD_BEARING
@@ -285,10 +323,12 @@ class Engine:
             if probes:
                 base_p = [self.runner.batch(doc.original, probes,
                                             f"probe-base-r{r}")
-                          for r in range(2)]
+                          for r in range(cfg.probe_replicates)]
                 self._warm([o for rep in base_p for o in rep])
-                pnoise = [self.metric.score(base_p[0][i], base_p[1][i])
-                          for i in range(len(probes))]
+                pnoise = [self.metric.score(base_p[a][i], base_p[b][i])
+                          for i in range(len(probes))
+                          for a in range(len(base_p))
+                          for b in range(a + 1, len(base_p))]
                 variant = doc.rebuild(removed={leaf.id})
                 outs = self.runner.batch(variant, probes,
                                          f"probe-del-{leaf.id}")
@@ -302,7 +342,11 @@ class Engine:
                     sv.example = _example(pt, probes, outs, base_p)
                     sv.note = ("Zero effect on real traffic, but targeted "
                                "probes activate it. The rule is live — your "
-                               "users just never go there.")
+                               "users just never go there. Probe-based "
+                               f"verdict on {len(probes)} probes × "
+                               f"{cfg.probe_replicates} noise replicates: "
+                               "treat as 'probably live'; raise --probe-n "
+                               "before treating it as settled.")
                     _log(cfg, f"      · {leaf.id} UNEXERCISED-but-exercisable "
                               f"(probes fire eff {pt.effect:+.3f})  "
                               f"“{leaf.display}”")

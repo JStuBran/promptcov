@@ -54,6 +54,90 @@ def test_stats_sparse():
     assert r.significant and r.mode == "sparse" and r.tail_hits >= 2
 
 
+def test_bh_and_bonferroni_textbook_vectors():
+    ps = [0.005, 0.011, 0.02, 0.04, 0.13]
+    bh = st.adjust_pvalues(ps, "bh")
+    expected = [0.025, 0.0275, 1 / 30, 0.05, 0.13]
+    assert all(abs(a - b) < 1e-9 for a, b in zip(bh, expected))
+    bon = st.adjust_pvalues(ps, "bonferroni")
+    assert all(abs(a - b) < 1e-9
+               for a, b in zip(bon, [0.025, 0.055, 0.1, 0.2, 0.65]))
+    assert st.adjust_pvalues(ps, "none") == ps
+    # order preservation: shuffled input maps back correctly
+    shuffled = [0.13, 0.005, 0.04, 0.011, 0.02]
+    bh2 = st.adjust_pvalues(shuffled, "bh")
+    assert abs(bh2[1] - 0.025) < 1e-9 and abs(bh2[0] - 0.13) < 1e-9
+
+
+def test_deciding_p_combines_channels():
+    r = st.TestResult(scores=[], noise=[], p_value=0.03, p_tail=0.5)
+    assert abs(st.deciding_p(r) - 0.06) < 1e-12
+    r2 = st.TestResult(scores=[], noise=[], p_value=0.9, p_tail=0.001)
+    assert abs(st.deciding_p(r2) - 0.002) < 1e-12
+    r3 = st.TestResult(scores=[], noise=[], p_value=0.9, p_tail=0.8)
+    assert st.deciding_p(r3) == 1.0  # capped
+
+
+def test_bh_reduces_false_positives_preserves_strong_effect():
+    rng = random.Random(42)
+    null_ps = [rng.uniform(0.0, 1.0) for _ in range(40)]
+    ps = null_ps + [0.0001]
+    raw_hits = sum(1 for p in ps if p < 0.05)
+    adjusted = st.adjust_pvalues(ps, "bh")
+    bh_hits = sum(1 for a in adjusted if a < 0.10)
+    assert adjusted[-1] < 0.10          # the real effect survives
+    assert bh_hits < raw_hits           # the null flags are filtered
+    assert bh_hits <= 2
+
+
+def test_demo_verdicts_stable_across_correction_modes():
+    inputs = [ln.split('"input": "')[1].rsplit('"', 1)[0]
+              for ln in open(os.path.join(EXAMPLES, "traffic.jsonl"))
+              if ln.strip()]
+    pinned = {"S2.L2": st.LOAD_BEARING, "S5.L3": st.LOAD_BEARING,
+              "S2.L6": st.NO_OBSERVED_EFFECT, "S6.L2": st.UNEXERCISED}
+    with tempfile.TemporaryDirectory() as td:  # shared cache: 2nd run ~free
+        for mode in ("none", "bh"):
+            eng = Engine(MockProvider(),
+                         Config(do_negate=True, do_probes=True,
+                                exhaustive=True, verbose=False,
+                                correction=mode), cache_dir=td)
+            res = eng.run(ARIA, inputs)
+            for sid, want in pinned.items():
+                assert res.verdicts[sid].verdict == want, (mode, sid)
+    # corrected run surfaces q and the family size
+    assert res.meta["correction"] == "bh" and res.meta["n_tests"] > 0
+    d = res.verdicts["S2.L2"].deletion
+    assert d.q is not None and d.summary()["q"] is not None
+
+
+def test_sparse_channel_does_not_escape_correction():
+    # a sparse-only leaf (dense p ~1, binomial tail p tiny) must live or die
+    # by its corrected deciding p, exactly like a dense leaf
+    with tempfile.TemporaryDirectory() as td:
+        eng = Engine(MockProvider(), Config(verbose=False), cache_dir=td)
+    sparse = st.TestResult(scores=[0.5] * 5, noise=[0.05] * 20,
+                           p_value=0.98, p_tail=0.001, tail_hits=3,
+                           effect=0.0, significant=True, mode="sparse")
+    eng._apply_corrected_decision(sparse, qv=0.04)   # survives at q<0.10
+    assert sparse.significant and sparse.mode == "sparse"
+    sparse2 = st.TestResult(scores=[0.5] * 5, noise=[0.05] * 20,
+                            p_value=0.98, p_tail=0.001, tail_hits=3,
+                            effect=0.0, significant=True, mode="sparse")
+    eng._apply_corrected_decision(sparse2, qv=0.4)   # corrected away
+    assert not sparse2.significant and sparse2.mode == ""
+
+
+def test_probe_replicates_scale_estimate_and_noise():
+    from promptcov.engine import estimate_calls
+    doc = parse(ARIA)
+    lo3, hi3 = estimate_calls(doc, 28, Config(do_probes=True,
+                                              probe_replicates=3))
+    lo4, hi4 = estimate_calls(doc, 28, Config(do_probes=True,
+                                              probe_replicates=4))
+    assert hi4 > hi3
+
+
 def test_negation_heuristics():
     assert "NEVER" in negate_heuristic("You MUST ALWAYS do X\n").upper()
     assert negate_heuristic("If the customer asks, comply.\n") is None
