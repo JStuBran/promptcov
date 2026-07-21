@@ -132,6 +132,43 @@ def test_corpus_loader():
         os.unlink(path)
 
 
+def test_payload_contract_v2():
+    from promptcov.report import payload
+    inputs = [f"question number {i}" for i in range(8)]
+
+    def run_once():
+        with tempfile.TemporaryDirectory() as td:
+            eng = Engine(MockProvider(), Config(replicates=2, verbose=False),
+                         cache_dir=td)
+            return payload(eng.run(ARIA, inputs))
+
+    p1, p2 = run_once(), run_once()
+    m = p1["meta"]
+    assert m["schema_version"] == 2
+    assert len(m["prompt_sha256"]) == 64 and len(m["corpus_sha256"]) == 64
+    for key in ("metric", "replicates", "negate", "probes", "probe_n",
+                "alpha", "min_effect", "exhaustive", "temperature",
+                "max_tokens", "provider", "model"):
+        assert key in m, key
+    assert m["metric"] == "lexical"
+    # content hashes are deterministic across runs
+    assert p2["meta"]["prompt_sha256"] == m["prompt_sha256"]
+    assert p2["meta"]["corpus_sha256"] == m["corpus_sha256"]
+
+
+def test_corpus_loader_rejects_truncated_json():
+    from promptcov.cli import _load_corpus
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                     delete=False) as fh:
+        fh.write('{"input": "x"\n')  # truncated: missing closing brace
+        path = fh.name
+    try:
+        with pytest.raises(SystemExit, match=r":1: .*not\s+valid JSON"):
+            _load_corpus(path, None)
+    finally:
+        os.unlink(path)
+
+
 def test_replicates_guard():
     from promptcov.cli import main
     prompt = os.path.join(EXAMPLES, "aria_prompt.md")

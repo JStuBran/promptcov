@@ -12,6 +12,8 @@ The engine never says "useless" and neither should you.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import statistics
 import sys
 import time
@@ -76,6 +78,21 @@ class Results:
     kept_redundant: list[str] = field(default_factory=list)
     verification: dict = field(default_factory=dict)
     meta: dict = field(default_factory=dict)
+
+
+SCHEMA_VERSION = 2
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def corpus_sha256(inputs: list) -> str:
+    """Content hash of the corpus, canonicalized so key order and
+    whitespace in the source file can never change the identity."""
+    canon = json.dumps(inputs, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"))
+    return _sha256_text(canon)
 
 
 def _log(cfg: Config, msg: str):
@@ -166,15 +183,25 @@ class Engine:
         self._prune_and_verify(doc, inputs, res)
 
         res.meta = {
+            # comparability contract: everything `check`/`compare` need to
+            # validate that two reports are talking about the same run shape
+            "schema_version": SCHEMA_VERSION,
+            "prompt_sha256": _sha256_text(prompt_text),
+            "corpus_sha256": corpus_sha256(inputs),
+            "metric": "lexical",
             "provider": self.p.name,
             "model": getattr(self.p, "model", "mock/aria-sim"),
             "inputs": len(inputs),
             "replicates": cfg.replicates,
-            "provider_calls": self.runner.calls,
-            "seconds": round(time.time() - t0, 1),
             "negate": cfg.do_negate, "probes": cfg.do_probes,
+            "probe_n": cfg.probe_n,
             "alpha": cfg.alpha, "min_effect": cfg.min_effect,
             "exhaustive": cfg.exhaustive,
+            "temperature": getattr(self.p, "temperature", None),
+            "max_tokens": getattr(self.p, "max_tokens", None),
+            # run-cost fields — never part of any comparability check
+            "provider_calls": self.runner.calls,
+            "seconds": round(time.time() - t0, 1),
         }
         return res
 

@@ -25,6 +25,12 @@ def _load_corpus(path: str, max_inputs: int | None) -> list[str]:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                if line.startswith("{"):
+                    raise SystemExit(
+                        f"{path}:{lineno}: line starts with '{{' but is not "
+                        f"valid JSON — a truncated or malformed row would "
+                        f"otherwise be silently replayed as literal text. "
+                        f"Fix the row or quote it as a JSON string.")
                 inputs.append(line)  # plain-text line: use it verbatim
                 continue
             if isinstance(obj, dict):
