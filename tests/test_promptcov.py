@@ -507,6 +507,208 @@ def test_runner_cache_hits_and_persistence():
         assert p2.calls == 0 and r2.calls == 0
 
 
+class _FakeBatchProvider:
+    """Delegates outputs to MockProvider but serves them through the
+    Message Batches surface: submit → poll (in_progress once) → results
+    in deliberately scrambled order. Shares MockProvider's cache
+    namespace so batch and sync runs reuse each other's cache."""
+    name = "mock"
+    model = "mock/aria-sim"
+    batch_enabled = True
+
+    def __init__(self, store=None):
+        self._mock = MockProvider()
+        self.store = store if store is not None else {}
+        self.submits = 0
+        self.polls = {}
+
+    def complete(self, system, user, run_tag=""):
+        return self._mock.complete(system, user, run_tag)
+
+    def generate_probes(self, rule, n=4):
+        return self._mock.generate_probes(rule, n)
+
+    def submit_batch(self, reqs):
+        assert len({r["custom_id"] for r in reqs}) == len(reqs), \
+            "duplicate custom_ids in one batch submission"
+        self.submits += 1
+        bid = f"batch_{len(self.store)}"
+        self.store[bid] = list(reqs)
+        return bid
+
+    def poll_batch(self, bid):
+        n = self.polls.get(bid, 0)
+        self.polls[bid] = n + 1
+        return {"processing_status": "in_progress" if n == 0 else "ended",
+                "request_counts": {"processing": 0}}
+
+    def results_for(self, req):
+        return ("succeeded",
+                self._mock.complete(req["system"], req["user"],
+                                    req["run_tag"]))
+
+    def batch_results(self, bid):
+        reqs = list(self.store[bid])
+        reqs.reverse()          # results arrive in arbitrary order
+        for r in reqs:
+            kind, payload = self.results_for(r)
+            yield r["custom_id"], kind, payload
+
+
+def _traffic_inputs():
+    return [ln.split('"input": "')[1].rsplit('"', 1)[0]
+            for ln in open(os.path.join(EXAMPLES, "traffic.jsonl"))
+            if ln.strip()]
+
+
+def test_batch_run_matches_sync_run_exactly(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    inputs = _traffic_inputs()
+    cfg = lambda: Config(do_negate=True, do_probes=True, exhaustive=True,  # noqa: E731
+                         verbose=False)
+    with tempfile.TemporaryDirectory() as td_sync, \
+            tempfile.TemporaryDirectory() as td_batch:
+        sync_res = Engine(MockProvider(), cfg(),
+                          cache_dir=td_sync).run(ARIA, inputs)
+        fake = _FakeBatchProvider()
+        batch_res = Engine(fake, cfg(),
+                           cache_dir=td_batch).run(ARIA, inputs)
+        assert fake.submits == 4  # baseline, sections, leaves, verify
+        v_sync = {k: sv.verdict for k, sv in sync_res.verdicts.items()}
+        v_batch = {k: sv.verdict for k, sv in batch_res.verdicts.items()}
+        assert v_sync == v_batch
+        assert sync_res.pruned_prompt == batch_res.pruned_prompt
+        # cache namespace is shared: a sync run over the batch run's cache
+        # dir makes zero fresh provider calls for the corpus sweeps
+        eng2 = Engine(MockProvider(), cfg(), cache_dir=td_batch)
+        eng2.run(ARIA, inputs)
+        assert eng2.runner.calls == 0
+
+
+def test_batch_dedupes_duplicate_corpus_rows(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import Runner
+    with tempfile.TemporaryDirectory() as td:
+        fake = _FakeBatchProvider()
+        r = Runner(fake, cache_dir=td)
+        outs = r.batch_group([("sys", ["dup", "dup", "other"], "t0")])
+        # the assert inside submit_batch proves the dedupe; results fan
+        # back to every position
+        assert outs[0][0] == outs[0][1]
+        assert len(outs[0]) == 3
+
+
+def test_batch_resume_from_manifest(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import Runner
+
+    class _KilledMidPoll(_FakeBatchProvider):
+        def poll_batch(self, bid):
+            raise KeyboardInterrupt
+
+    with tempfile.TemporaryDirectory() as td:
+        store = {}
+        killed = _KilledMidPoll(store)
+        r1 = Runner(killed, cache_dir=td)
+        r1.fingerprint = {"prompt_sha256": "aaa", "corpus_sha256": "bbb"}
+        with pytest.raises(KeyboardInterrupt):
+            r1.batch_group([("sys", ["u1", "u2"], "t0")])
+        assert killed.submits == 1
+        # rerun: same fingerprint, same store — resumes, zero resubmission
+        fake2 = _FakeBatchProvider(store)
+        r2 = Runner(fake2, cache_dir=td)
+        r2.fingerprint = {"prompt_sha256": "aaa", "corpus_sha256": "bbb"}
+        outs = r2.batch_group([("sys", ["u1", "u2"], "t0")])
+        assert fake2.submits == 0 and len(outs[0]) == 2
+
+
+def test_batch_discards_stale_manifest(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import Runner
+    with tempfile.TemporaryDirectory() as td:
+        store = {}
+        killed_fp = {"prompt_sha256": "OLD", "corpus_sha256": "OLD"}
+        r0 = Runner(_FakeBatchProvider(store), cache_dir=td)
+        r0._manifest_append({"batch_id": "batch_stale", "tag": "t0",
+                             "fingerprint": killed_fp, "created": 1.0,
+                             "requests": [{"custom_id": "x", "system": "s",
+                                           "user": "u", "run_tag": "t0"}]})
+        fake = _FakeBatchProvider(store)
+        r = Runner(fake, cache_dir=td)
+        r.fingerprint = {"prompt_sha256": "NEW", "corpus_sha256": "NEW"}
+        r.batch_group([("sys", ["u1"], "t0")])
+        assert fake.submits == 1     # fresh submission, stale one discarded
+        assert "batch_stale" not in r._manifest_open()
+
+
+def test_batch_per_item_errors(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import Runner
+
+    class _ExpireOnce(_FakeBatchProvider):
+        def results_for(self, req):
+            if req["user"] == "flaky" and self.submits == 1:
+                return ("retryable", "expired")
+            return super().results_for(req)
+
+    class _InvalidItem(_FakeBatchProvider):
+        def results_for(self, req):
+            if req["user"] == "bad":
+                return ("errored_invalid", "invalid_request_error")
+            return super().results_for(req)
+
+    class _AlwaysExpires(_FakeBatchProvider):
+        def results_for(self, req):
+            return ("retryable", "expired")
+
+    with tempfile.TemporaryDirectory() as td:
+        p = _ExpireOnce()
+        r = Runner(p, cache_dir=td)
+        outs = r.batch_group([("sys", ["ok", "flaky"], "t0")])
+        assert p.submits == 2 and len(outs[0]) == 2   # one bounded resubmit
+    with tempfile.TemporaryDirectory() as td:
+        r = Runner(_InvalidItem(), cache_dir=td)
+        with pytest.raises(RuntimeError, match="invalid_request"):
+            r.batch_group([("sys", ["ok", "bad"], "t0")])
+    with tempfile.TemporaryDirectory() as td:
+        r = Runner(_AlwaysExpires(), cache_dir=td)
+        with pytest.raises(RuntimeError, match="unresolved"):
+            r.batch_group([("sys", ["ok"], "t0")])
+
+
+def test_batch_no_wait_submits_and_resumes(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import BatchPending, Runner
+    with tempfile.TemporaryDirectory() as td:
+        store = {}
+        p1 = _FakeBatchProvider(store)
+        r1 = Runner(p1, cache_dir=td)
+        r1.no_wait = True
+        with pytest.raises(BatchPending):
+            r1.batch_group([("sys", ["u1"], "t0")])
+        assert p1.submits == 1
+        p2 = _FakeBatchProvider(store)
+        r2 = Runner(p2, cache_dir=td)
+        outs = r2.batch_group([("sys", ["u1"], "t0")])
+        assert p2.submits == 0 and outs[0][0]
+
+
+def test_dry_run_batch_split(capsys):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    assert main(["run", "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--dry-run", "--batch"]) == 0
+    out = capsys.readouterr().out
+    assert "50% price" in out and "synchronous" in out
+
+
 class _EitherOrProvider:
     """Behavior depends only on whether at least one of two rules survives:
     deleting either alone is inert, deleting both is catastrophic. This is

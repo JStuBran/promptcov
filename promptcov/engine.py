@@ -74,6 +74,18 @@ def estimate_calls(doc: Doc, n_inputs: int, cfg: Config) -> tuple[int, int]:
     return floor, ceil
 
 
+def estimate_batch_split(doc: Doc, n_inputs: int,
+                         cfg: Config) -> tuple[int, int]:
+    """(batchable, sync_only) worst-case calls under --batch. Corpus sweeps
+    (baseline, section/leaf deletions, first verification) batch at 50%
+    price; negation/probe/judge generation and rescue stay synchronous."""
+    s, l = len(doc.sections), len(doc.leaves())
+    batchable = (cfg.replicates * n_inputs + s * n_inputs + l * n_inputs
+                 + n_inputs)
+    _, ceil = estimate_calls(doc, n_inputs, cfg)
+    return batchable, max(0, ceil - batchable)
+
+
 @dataclass
 class Results:
     doc: Doc | None = None
@@ -137,7 +149,8 @@ class Engine:
         self.metric = metric or LexicalMetric()
         self.judge = judge
         self.runner = Runner(provider, cache_dir=cache_dir,
-                             concurrency=cfg.concurrency)
+                             concurrency=cfg.concurrency,
+                             verbose=cfg.verbose)
 
     def _warm(self, texts: list[str]):
         if hasattr(self.metric, "warm"):
@@ -148,6 +161,10 @@ class Engine:
         cfg = self.cfg
         t0 = time.time()
         doc = parse(prompt_text)
+        # batch-resume identity: a manifest entry only resumes when it was
+        # submitted for this exact prompt + corpus
+        self.runner.fingerprint = {"prompt_sha256": _sha256_text(prompt_text),
+                                   "corpus_sha256": corpus_sha256(inputs)}
         res = Results(doc=doc, inputs=inputs)
         leaves = doc.leaves()
         _log(cfg, f"● segmented: {len(doc.sections)} sections, "
@@ -159,9 +176,9 @@ class Engine:
         # 1 — baseline replicates + noise floor -------------------------
         _log(cfg, f"● baseline: {cfg.replicates} replicates × "
                   f"{len(inputs)} inputs")
-        for r in range(cfg.replicates):
-            res.baseline.append(
-                self.runner.batch(prompt_text, inputs, f"base-r{r}"))
+        res.baseline = self.runner.batch_group(
+            [(prompt_text, inputs, f"base-r{r}")
+             for r in range(cfg.replicates)])
         self._warm([o for rep in res.baseline for o in rep])
         for i in range(len(inputs)):
             reps = [b[i] for b in res.baseline]
@@ -178,9 +195,12 @@ class Engine:
         # a reported claim, and a section holding contradictory rules can
         # cancel to near-zero mean effect while its children are
         # individually load-bearing.
-        frontier: list[tuple[Segment, st.TestResult]] = []
-        for sec in doc.sections:
-            tr = self._test_deletion(doc, {sec.id}, inputs, res)
+        sec_outs = self.runner.batch_group(
+            [(doc.rebuild(removed={sec.id}), inputs, f"var-del-{sec.id}")
+             for sec in doc.sections])
+        pending_leaves: list[Segment] = []
+        for sec, outs in zip(doc.sections, sec_outs):
+            tr = self._eval_variant(outs, res)
             res.section_tests[sec.id] = tr
             signal = tr.significant or tr.p_value < cfg.alpha
             recurse = signal or cfg.exhaustive
@@ -191,15 +211,19 @@ class Engine:
                       f"eff {tr.effect:+.3f}  p={tr.p_value:.3f}  "
                       f"— {verdict_word}")
             if recurse:
-                for leaf in sec.children:
-                    d = self._test_deletion(doc, {leaf.id}, inputs, res)
-                    frontier.append((leaf, d))
+                pending_leaves.extend(sec.children)
             else:
                 for leaf in sec.children:
                     res.verdicts[leaf.id] = st.SegmentVerdict(
                         leaf.id, st.INHERITED, deletion=None,
                         note="Whole section deleted with no observed "
                              "effect; leaf not tested individually.")
+
+        leaf_outs = self.runner.batch_group(
+            [(doc.rebuild(removed={leaf.id}), inputs, f"var-del-{leaf.id}")
+             for leaf in pending_leaves])
+        frontier = [(leaf, self._eval_variant(outs, res))
+                    for leaf, outs in zip(pending_leaves, leaf_outs)]
 
         # 2b — correct the deletion family, then decide + cascade -------
         res.n_tests = len(frontier)
@@ -243,12 +267,7 @@ class Engine:
         return res
 
     # ------------------------------------------------------------------
-    def _test_deletion(self, doc: Doc, removed: set[str],
-                       inputs: list[str], res: Results,
-                       tag: str = "") -> st.TestResult:
-        variant = doc.rebuild(removed=removed)
-        outs = self.runner.batch(variant, inputs,
-                                 f"var-del-{'|'.join(sorted(removed))}{tag}")
+    def _eval_variant(self, outs: list[str], res: Results) -> st.TestResult:
         self._warm(outs)
         tr = st.evaluate(_variant_scores(outs, res.baseline, self.metric),
                          res.noise, self.cfg.alpha, self.cfg.min_effect,
@@ -420,8 +439,13 @@ class Engine:
         margin = max(cfg.min_effect, cfg.sparse_margin)
         p99 = st.percentile(res.noise, 0.99)
 
-        def verify(prompt: str) -> tuple[st.TestResult, list[int]]:
-            outs = self.runner.batch(prompt, inputs, "verify")
+        def verify(prompt: str,
+                   grouped: bool = False) -> tuple[st.TestResult, list[int]]:
+            # the first verification is batchable; rescue trials are serial
+            # by nature (each depends on the last) and stay synchronous
+            outs = (self.runner.batch_group([(prompt, inputs, "verify")])[0]
+                    if grouped else
+                    self.runner.batch(prompt, inputs, "verify"))
             self._warm(outs)
             scores = _variant_scores(outs, res.baseline, self.metric)
             tr = st.evaluate(scores, res.noise, cfg.alpha, cfg.min_effect,
@@ -430,7 +454,7 @@ class Engine:
             return tr, bad
 
         candidate = doc.rebuild(removed=pruned)
-        vtr, bad = verify(candidate)
+        vtr, bad = verify(candidate, grouped=True)
         rescue_log = []
 
         if vtr.significant and cfg.rescue:

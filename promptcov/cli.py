@@ -45,13 +45,14 @@ def _load_corpus(path: str, max_inputs: int | None) -> list[str]:
     return inputs[:max_inputs] if max_inputs else inputs
 
 
-def _provider(name: str, model: str, temperature: float, max_tokens: int):
+def _provider(name: str, model: str, temperature: float, max_tokens: int,
+              batch: bool = False):
     if name == "mock":
         from .providers import MockProvider
         return MockProvider()
     from .providers import AnthropicProvider
     return AnthropicProvider(model=model, temperature=temperature,
-                             max_tokens=max_tokens)
+                             max_tokens=max_tokens, batch=batch)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -117,6 +118,13 @@ def main(argv: list[str] | None = None) -> int:
                      help="raise if your agent's responses run long; "
                           "truncation reads as fake divergence")
     run.add_argument("--concurrency", type=int, default=8)
+    run.add_argument("--batch", action="store_true",
+                     help="run corpus sweeps through the Anthropic Message "
+                          "Batches API (50%% price; up to 24h per phase; "
+                          "safe to Ctrl-C and rerun to resume)")
+    run.add_argument("--no-wait", action="store_true",
+                     help="with --batch: submit the current phase and exit; "
+                          "rerun the same command later to resume")
     run.add_argument("--dry-run", action="store_true",
                      help="print the segmentation and call estimate, "
                           "make zero model calls, exit")
@@ -192,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
                  "exercise the judge through injected doubles)")
 
     if args.dry_run:
-        from .engine import estimate_calls
+        from .engine import estimate_batch_split, estimate_calls
         from .segmenter import parse
         doc = parse(prompt_text)
         lo, hi = estimate_calls(doc, len(inputs), cfg)
@@ -200,6 +208,13 @@ def main(argv: list[str] | None = None) -> int:
               f"leaves · {len(inputs)} inputs · {cfg.replicates} replicates")
         print(f"model calls: {lo:,} (nothing recurses) → {hi:,} (worst "
               f"case), before cache hits — reruns are ~free")
+        if args.batch:
+            batchable, sync_only = estimate_batch_split(doc, len(inputs),
+                                                        cfg)
+            print(f"with --batch: up to {batchable:,} calls run through "
+                  f"Message Batches at 50% price; up to {sync_only:,} "
+                  f"generation/rescue/judge calls stay synchronous at "
+                  f"full price")
         print("no model calls were made. run `promptcov segments` to "
               "inspect the leaf breakdown.")
         return 0
@@ -222,9 +237,19 @@ def main(argv: list[str] | None = None) -> int:
                       cache_dir=args.cache_dir)
 
     engine = Engine(_provider(args.provider, args.model,
-                              args.temperature, args.max_tokens), cfg,
+                              args.temperature, args.max_tokens,
+                              batch=args.batch), cfg,
                     cache_dir=args.cache_dir, metric=metric, judge=judge)
-    res = engine.run(prompt_text, inputs)
+    engine.runner.no_wait = args.no_wait
+    from .runner import BatchPending
+    try:
+        res = engine.run(prompt_text, inputs)
+    except BatchPending as bp:
+        print(f"● submitted and not waiting: "
+              f"{', '.join(bp.batch_ids)}", file=sys.stderr)
+        print("● results are retained for 29 days — rerun this exact "
+              "command to poll, merge, and continue", file=sys.stderr)
+        return 0
 
     html = render(res, title=os.path.basename(args.prompt))
     with open(args.out, "w") as fh:

@@ -25,9 +25,11 @@ import time
 
 class AnthropicProvider:
     name = "anthropic"
+    batch_enabled = False    # instance-level True under --batch
 
     def __init__(self, model: str = "claude-sonnet-4-6",
-                 max_tokens: int = 1024, temperature: float = 1.0):
+                 max_tokens: int = 1024, temperature: float = 1.0,
+                 batch: bool = False):
         import httpx  # lazy: mock mode stays dependency-free
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
@@ -37,6 +39,7 @@ class AnthropicProvider:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.batch_enabled = batch
         # name is the cache namespace: outputs are only reusable for the
         # exact same model + sampling settings
         self.name = f"anthropic:{model}:t{temperature}:m{max_tokens}"
@@ -71,6 +74,72 @@ class AnthropicProvider:
         })
         return "".join(b.get("text", "") for b in data.get("content", [])
                        if b.get("type") == "text")
+
+    # --------------------- Message Batches (50% price) --------------------
+    # The same completion params as complete(), submitted asynchronously.
+    # custom_id is the Runner's sha256 cache key (64 hex chars — exactly
+    # the API's custom_id limit); prompt caching uses the 1-hour TTL since
+    # batches routinely outlive the 5-minute ephemeral window.
+
+    def _request(self, method: str, url: str, body: dict | None = None):
+        delay = 2.0
+        for _ in range(6):
+            r = self._client.request(method, url, json=body)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 529):
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
+        raise RuntimeError("API retries exhausted")
+
+    def submit_batch(self, reqs: list[dict]) -> str:
+        body = {"requests": [
+            {"custom_id": r["custom_id"],
+             "params": {
+                 "model": self.model,
+                 "max_tokens": self.max_tokens,
+                 "temperature": self.temperature,
+                 "system": [{"type": "text", "text": r["system"],
+                             "cache_control": {"type": "ephemeral",
+                                               "ttl": "1h"}}],
+                 "messages": [{"role": "user", "content": r["user"]}],
+             }} for r in reqs]}
+        return self._request("POST", "/v1/messages/batches", body).json()["id"]
+
+    def poll_batch(self, batch_id: str) -> dict:
+        return self._request("GET", f"/v1/messages/batches/{batch_id}").json()
+
+    def batch_results(self, batch_id: str):
+        """Yield (custom_id, kind, payload): kind is 'succeeded' (payload =
+        text), 'errored_invalid' (not retryable), or 'retryable'."""
+        info = self.poll_batch(batch_id)
+        url = info.get("results_url")
+        if not url:
+            return
+        resp = self._request("GET", url)
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            cid, result = rec.get("custom_id"), rec.get("result", {})
+            rtype = result.get("type")
+            if rtype == "succeeded":
+                content = result.get("message", {}).get("content", [])
+                text = "".join(b.get("text", "") for b in content
+                               if b.get("type") == "text")
+                yield cid, "succeeded", text
+            elif rtype == "errored":
+                err = result.get("error", {})
+                etype = err.get("error", {}).get("type", err.get("type", ""))
+                if "invalid" in str(etype):
+                    yield cid, "errored_invalid", str(etype)
+                else:
+                    yield cid, "retryable", str(etype)
+            else:  # canceled / expired
+                yield cid, "retryable", rtype
 
     def _small(self, prompt: str) -> str:
         data = self._post({"model": self.model, "max_tokens": 400,
