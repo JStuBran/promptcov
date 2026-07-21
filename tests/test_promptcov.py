@@ -1136,6 +1136,47 @@ def test_check_unknown_and_duplicates():
     assert code == EXIT_PASS and out["new_unmatched"]
 
 
+def test_check_matching_tolerates_whitespace_drift():
+    # deleting a neighbor rule shifts a survivor's trailing blank lines —
+    # segmentation noise must not read as deletion + new rule
+    from promptcov.check import EXIT_PASS, compare_reports
+
+    def stub(segs):
+        return {"meta": {"schema_version": 2, "prompt_sha256": "p" * 64,
+                         "corpus_sha256": "c" * 64, "metric": "lexical",
+                         "model": "m", "temperature": 1.0,
+                         "max_tokens": 64, "replicates": 2,
+                         "negate": False, "probes": False, "probe_n": 4,
+                         "probe_replicates": 3, "alpha": 0.05,
+                         "min_effect": 0.02, "correction": "bh", "q": 0.1,
+                         "exhaustive": False, "judge": False,
+                         "judge_model": None},
+                "segments": segs}
+
+    base = stub([{"id": "S1.L1", "kind": "leaf",
+                  "text": "rule A\n\n", "verdict": st.LOAD_BEARING}])
+    cand = stub([{"id": "S1.L1", "kind": "leaf",
+                  "text": "rule A\n\n\n", "verdict": st.LOAD_BEARING}])
+    code, out = compare_reports(base, cand, strict=True)
+    assert code == EXIT_PASS
+    assert not out["regressions"] and not out["new_unmatched"]
+
+
+def test_quiet_silences_artifact_announcements(tmp_path, capsys):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    args = ["run", "--prompt", prompt, "--corpus", corpus,
+            "--provider", "mock", "--max-inputs", "8",
+            "--out", str(tmp_path / "r.html"),
+            "--pruned-out", str(tmp_path / "p.md"),
+            "--cache-dir", str(tmp_path / "cache")]
+    assert main(args + ["--quiet"]) == 0
+    assert "● report" not in capsys.readouterr().err
+    assert main(args) == 0
+    assert "● report" in capsys.readouterr().err
+
+
 def test_check_neutralized_and_deleted_kept_buckets():
     from promptcov.check import EXIT_PASS, EXIT_POLICY, compare_reports
 

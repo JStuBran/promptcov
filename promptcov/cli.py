@@ -486,19 +486,21 @@ def main(argv: list[str] | None = None) -> int:
     html = render(res, title=os.path.basename(args.prompt))
     with open(args.out, "w") as fh:
         fh.write(html)
-    print(f"● report: {args.out}", file=sys.stderr)
 
     from .report import payload
     json_path = os.path.splitext(args.out)[0] + ".json"
     with open(json_path, "w") as fh:
         json.dump(payload(res), fh, indent=1)
-    print(f"● machine-readable verdicts: {json_path}", file=sys.stderr)
 
     pruned_path = args.pruned_out or (
         os.path.splitext(args.prompt)[0] + ".pruned.md")
     with open(pruned_path, "w") as fh:
         fh.write(res.pruned_prompt)
-    print(f"● verified pruned prompt: {pruned_path}", file=sys.stderr)
+
+    if not args.quiet:  # check --run's inner run announces nothing
+        print(f"● report: {args.out}", file=sys.stderr)
+        print(f"● machine-readable verdicts: {json_path}", file=sys.stderr)
+        print(f"● verified pruned prompt: {pruned_path}", file=sys.stderr)
     return 0
 
 

@@ -2,9 +2,10 @@
 
 Diffs two stored report payloads — no API calls, no keys in CI, no
 statistical flakiness from fresh runs. Regressions are judged by
-direction against the BASELINE's verdicts, matched by leaf text (the
-structural S{n}.L{m} ids drift on every edit; text is the stable
-anchor).
+direction against the BASELINE's verdicts, matched by whitespace-
+normalized leaf text (the structural S{n}.L{m} ids drift on every edit;
+text is the stable anchor, and blank-line drift around an edit is
+segmentation noise, not content).
 
 Fail-closed: a baseline LOAD_BEARING leaf whose text is absent from the
 candidate always fails. Deletion and rewording are indistinguishable by
@@ -68,9 +69,13 @@ def leaves(payload: dict) -> list[dict]:
 
 
 def _by_text(items: list[dict]) -> dict[str, list[dict]]:
+    """Key leaves by whitespace-normalized text. Editing an adjacent rule
+    routinely shifts a neighbor's trailing blank lines — that is
+    segmentation drift, not a content change, and must never read as a
+    deletion + new rule."""
     out: dict[str, list[dict]] = {}
     for leaf in items:
-        out.setdefault(leaf["text"], []).append(leaf)
+        out.setdefault(leaf["text"].strip(), []).append(leaf)
     return out
 
 
