@@ -1,0 +1,16 @@
+# Python build & tooling
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# promptcov runtime artifacts
+.promptcov_cache/
+
+# Generated demo/report artifacts (recreate with `promptcov demo`)
+aria_report.html
+aria_report.json
+aria_pruned.md
