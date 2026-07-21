@@ -55,6 +55,83 @@ def _provider(name: str, model: str, temperature: float, max_tokens: int,
                              max_tokens=max_tokens, batch=batch)
 
 
+def _check(ap, args) -> int:
+    from .check import (EXIT_INFRA, CheckError, compare_reports,
+                        load_report, render_outcome)
+    try:
+        baseline = load_report(args.baseline)
+        if args.run:
+            if not (args.prompt and args.corpus):
+                ap.error("check --run needs --prompt and --corpus")
+            if args.candidate:
+                ap.error("check --run generates the candidate itself — "
+                         "drop the positional CANDIDATE argument")
+            candidate_path = _check_run_candidate(baseline, args)
+        else:
+            if not args.candidate:
+                ap.error("check needs a CANDIDATE report (or --run)")
+            candidate_path = args.candidate
+        candidate = load_report(candidate_path)
+        code, outcome = compare_reports(baseline, candidate,
+                                        strict=args.strict,
+                                        prompt_path=args.prompt)
+    except CheckError as e:
+        print(f"● check: not comparable — {e}", file=sys.stderr)
+        return EXIT_INFRA
+    render_outcome(outcome)
+    if args.json:
+        print(json.dumps(outcome, indent=1))
+    return code
+
+
+def _check_run_candidate(baseline: dict, args) -> str:
+    """--run mode: produce the candidate report with the baseline's own
+    recorded config, so the comparability preconditions hold by
+    construction."""
+    import tempfile
+    m = baseline["meta"]
+    out = os.path.join(tempfile.mkdtemp(prefix="promptcov-check-"),
+                       "candidate.html")
+    provider = "mock" if str(m.get("provider", "")).startswith("mock") \
+        else "anthropic"
+    argv = ["run", "--prompt", args.prompt, "--corpus", args.corpus,
+            "--provider", provider, "--out", out,
+            "--pruned-out", os.path.join(os.path.dirname(out), "pruned.md"),
+            "--cache-dir", args.cache_dir, "--quiet",
+            "--model", str(m["model"]),
+            "--replicates", str(m["replicates"]),
+            "--probe-n", str(m["probe_n"]),
+            "--probe-replicates", str(m["probe_replicates"]),
+            "--alpha", str(m["alpha"]),
+            "--min-effect", str(m["min_effect"]),
+            "--correction", str(m["correction"]),
+            "--q", str(m["q"])]
+    parts = str(m["metric"]).split(":")
+    argv += ["--metric", parts[0]]
+    if parts[0] == "embedding" and len(parts) > 1:
+        if parts[1] in ("voyage", "openai"):
+            argv += ["--embedding-api", parts[1]]
+            if len(parts) > 2:
+                argv += ["--embedding-model", ":".join(parts[2:])]
+        else:
+            argv += ["--embedding-model", ":".join(parts[1:])]
+    if m.get("temperature") is not None:
+        argv += ["--temperature", str(m["temperature"])]
+    if m.get("max_tokens") is not None:
+        argv += ["--max-tokens", str(m["max_tokens"])]
+    for flag, key in (("--negate", "negate"), ("--probes", "probes"),
+                      ("--exhaustive", "exhaustive"), ("--judge", "judge")):
+        if m.get(key):
+            argv.append(flag)
+    if m.get("judge"):
+        argv += ["--judge-model", str(m["judge_model"])]
+    rc = main(argv)
+    if rc != 0:
+        from .check import CheckError
+        raise CheckError(f"--run analysis failed with exit code {rc}")
+    return os.path.splitext(out)[0] + ".json"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="promptcov", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,6 +215,29 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("demo", help="run the packaged CloudNest/Aria demo offline")
 
+    chk = sub.add_parser("check", help="CI gate: fail when a prompt edit "
+                         "deletes a LOAD_BEARING rule (diffs two stored "
+                         "report JSONs — no model calls, no keys)")
+    chk.add_argument("baseline", help="committed baseline report JSON")
+    chk.add_argument("candidate", nargs="?", default=None,
+                     help="candidate report JSON (omit with --run)")
+    chk.add_argument("--strict", action="store_true",
+                     help="also fail when a NEW rule lands "
+                          "NO_OBSERVED_EFFECT (default: warn)")
+    chk.add_argument("--prompt", default=None,
+                     help="freshness gate: exit 3 if this working-tree "
+                          "prompt file does not hash to the candidate's "
+                          "prompt_sha256 — CI should always pass it")
+    chk.add_argument("--json", action="store_true",
+                     help="write the machine-readable outcome to stdout")
+    chk.add_argument("--run", action="store_true",
+                     help="generate the candidate report first by running "
+                          "the analysis with the BASELINE's recorded "
+                          "config (requires --prompt and --corpus)")
+    chk.add_argument("--corpus", default=None,
+                     help="corpus for --run")
+    chk.add_argument("--cache-dir", default=".promptcov_cache")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "segments":
@@ -158,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
             print("⚠ LARGE leaves ablate as one block — split them with "
                   "blank lines for finer verdicts")
         return 0
+
+    if args.cmd == "check":
+        return _check(ap, args)
 
     if args.cmd == "demo":
         here = os.path.join(os.path.dirname(__file__), "examples")

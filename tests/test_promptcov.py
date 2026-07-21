@@ -709,6 +709,146 @@ def test_dry_run_batch_split(capsys):
     assert "50% price" in out and "synchronous" in out
 
 
+# ------------------------------ check mode ------------------------------
+
+def _report_for(prompt_text, td):
+    from promptcov.report import payload
+    eng = Engine(MockProvider(),
+                 Config(do_negate=True, do_probes=True, exhaustive=True,
+                        verbose=False), cache_dir=td)
+    return payload(eng.run(prompt_text, _traffic_inputs()))
+
+
+LB_LINE = "2. NEVER greet the customer by name (PII incident, see JIRA-4471)"
+DEAD_LINE = ("Think step by step. Take a deep breath. "
+             "This is very important to my career.")
+
+
+def _check_fixtures(tmp_path):
+    """(baseline, del_lb, del_dead, new_dead) payloads over edited ARIAs."""
+    fixtures = {}
+    variants = {
+        "baseline": ARIA,
+        "del_lb": ARIA.replace(LB_LINE + "\n\n", ""),
+        "del_dead": ARIA.replace(DEAD_LINE + "\n\n", ""),
+        "new_dead": ARIA + "\nAlways remember that CloudNest is great.\n",
+    }
+    for name, text in variants.items():
+        assert name == "baseline" or text != ARIA
+        d = tmp_path / name
+        d.mkdir()
+        fixtures[name] = _report_for(text, str(d))
+    return fixtures
+
+
+def test_check_policy_outcomes(tmp_path):
+    from promptcov.check import (EXIT_PASS, EXIT_POLICY, compare_reports)
+    fx = _check_fixtures(tmp_path)
+    # deleting a dead rule passes
+    code, out = compare_reports(fx["baseline"], fx["del_dead"])
+    assert code == EXIT_PASS and out["result"] == "pass"
+    # deleting a LOAD_BEARING rule fails closed, naming the rule
+    code, out = compare_reports(fx["baseline"], fx["del_lb"])
+    assert code == EXIT_POLICY
+    assert any(LB_LINE in r["text"] for r in out["regressions"])
+    # a new dead rule warns by default, fails under --strict
+    code, out = compare_reports(fx["baseline"], fx["new_dead"])
+    assert code == EXIT_PASS and out["new_dead"]
+    code, out = compare_reports(fx["baseline"], fx["new_dead"], strict=True)
+    assert code == EXIT_POLICY
+
+
+def test_check_preconditions_and_freshness(tmp_path):
+    import copy
+    from promptcov.check import CheckError, compare_reports
+    fx = _check_fixtures(tmp_path)
+    base, cand = fx["baseline"], copy.deepcopy(fx["del_dead"])
+    # corpus mismatch
+    bad = copy.deepcopy(cand)
+    bad["meta"]["corpus_sha256"] = "0" * 64
+    with pytest.raises(CheckError, match="corpus mismatch"):
+        compare_reports(base, bad)
+    # verdict-affecting config mismatch (correction)
+    bad = copy.deepcopy(cand)
+    bad["meta"]["correction"] = "none"
+    with pytest.raises(CheckError, match="config mismatch on 'correction'"):
+        compare_reports(base, bad)
+    # freshness gate: --prompt file that doesn't hash to the candidate
+    other = tmp_path / "edited_prompt.md"
+    other.write_text(ARIA + "\nedited\n")
+    with pytest.raises(CheckError, match="stale candidate"):
+        compare_reports(base, cand, prompt_path=str(other))
+    # legacy payload
+    from promptcov.check import load_report
+    legacy = tmp_path / "legacy.json"
+    old = copy.deepcopy(base)
+    del old["meta"]["schema_version"]
+    legacy.write_text(json.dumps(old))
+    with pytest.raises(CheckError, match="legacy report"):
+        load_report(str(legacy))
+
+
+def test_check_unknown_and_duplicates():
+    from promptcov.check import EXIT_PASS, compare_reports
+
+    def stub(segs):
+        return {"meta": {"schema_version": 2, "prompt_sha256": "p" * 64,
+                         "corpus_sha256": "c" * 64, "metric": "lexical",
+                         "model": "m", "temperature": 1.0,
+                         "max_tokens": 64, "replicates": 2,
+                         "negate": False, "probes": False, "probe_n": 4,
+                         "probe_replicates": 3, "alpha": 0.05,
+                         "min_effect": 0.02, "correction": "bh", "q": 0.1,
+                         "exhaustive": False, "judge": False,
+                         "judge_model": None},
+                "segments": segs}
+
+    leaf = lambda i, text, v: {"id": f"S1.L{i}", "kind": "leaf",  # noqa: E731
+                               "text": text, "verdict": v}
+    # baseline INHERITED leaf becomes LOAD_BEARING: resolution change, pass
+    base = stub([leaf(1, "rule A\n", st.INHERITED)])
+    cand = stub([leaf(1, "rule A\n", st.LOAD_BEARING)])
+    code, out = compare_reports(base, cand)
+    assert code == EXIT_PASS and out["resolution_changes"]
+    # duplicate texts: one of two identical LOAD_BEARING leaves deleted,
+    # the survivor matches — not a regression
+    base = stub([leaf(1, "dup rule\n", st.LOAD_BEARING),
+                 leaf(2, "dup rule\n", st.LOAD_BEARING)])
+    cand = stub([leaf(1, "dup rule\n", st.LOAD_BEARING)])
+    code, out = compare_reports(base, cand)
+    assert code == EXIT_PASS and not out["regressions"]
+    # unmatched new text with a live verdict is unknown, not gated
+    base = stub([leaf(1, "rule A\n", st.LOAD_BEARING)])
+    cand = stub([leaf(1, "rule A\n", st.LOAD_BEARING),
+                 leaf(2, "brand new rule\n", st.UNEXERCISED)])
+    code, out = compare_reports(base, cand)
+    assert code == EXIT_PASS and out["new_unmatched"]
+
+
+def test_check_cli_run_parity(tmp_path, capsys):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    cache = str(tmp_path / "cache")
+    out = str(tmp_path / "base.html")
+    assert main(["run", "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--quiet", "--negate", "--probes",
+                 "--exhaustive", "--out", out,
+                 "--pruned-out", str(tmp_path / "p.md"),
+                 "--cache-dir", cache]) == 0
+    base_json = str(tmp_path / "base.json")
+    # two-file mode: identical prompt → pass, exit 0
+    assert main(["check", base_json, base_json, "--prompt", prompt]) == 0
+    # --run mode regenerates with the baseline's config and agrees
+    assert main(["check", base_json, "--run", "--prompt", prompt,
+                 "--corpus", corpus, "--cache-dir", cache, "--json"]) == 0
+    machine = json.loads(capsys.readouterr().out)
+    assert machine["result"] == "pass"
+    # missing candidate without --run is a usage error (argparse exit 2)
+    with pytest.raises(SystemExit):
+        main(["check", base_json])
+
+
 class _EitherOrProvider:
     """Behavior depends only on whether at least one of two rules survives:
     deleting either alone is inert, deleting both is catastrophic. This is
