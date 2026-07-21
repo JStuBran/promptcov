@@ -84,7 +84,8 @@ def _binom_tail(n: int, k: int, p: float) -> float:
 
 
 def evaluate(variant_scores: list[float], noise: list[float],
-             alpha: float = ALPHA, min_effect: float = MIN_EFFECT) -> TestResult:
+             alpha: float = ALPHA, min_effect: float = MIN_EFFECT,
+             sparse_margin: float = 0.01) -> TestResult:
     r = TestResult(scores=variant_scores, noise=noise)
     if not variant_scores:
         return r
@@ -98,7 +99,9 @@ def evaluate(variant_scores: list[float], noise: list[float],
     # sparse path: a rule that fires hard on a few inputs barely moves the
     # median, but the count of scores beyond the noise p99 is itself a test —
     # under the null each input exceeds p99 with prob ~0.01.
-    margin = max(min_effect, 0.01)
+    # sparse_margin is absolute, not noise-floor-relative — metrics with a
+    # tighter scale (embedding cosine) declare their own floor
+    margin = max(min_effect, sparse_margin)
     p99 = percentile(noise, 0.99)
     r.tail_hits = sum(1 for s in variant_scores if s > p99 + margin)
     r.p_tail = _binom_tail(n, r.tail_hits, 0.01)

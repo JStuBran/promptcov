@@ -132,6 +132,94 @@ def test_corpus_loader():
         os.unlink(path)
 
 
+class _StubMetric:
+    """Constant-scale stub: proves the engine routes every divergence
+    computation — noise floor included — through the configured metric."""
+    name = "stub"
+    from promptcov.metrics import SPECS as _S
+    spec = _S["lexical"]
+
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, a, b):
+        self.calls += 1
+        return 0.0 if a == b else 0.111111
+
+
+def test_metric_threads_through_scores_and_noise():
+    inputs = [f"question number {i}" for i in range(8)]
+    stub = _StubMetric()
+    with tempfile.TemporaryDirectory() as td:
+        eng = Engine(MockProvider(), Config(replicates=2, verbose=False),
+                     cache_dir=td, metric=stub)
+        res = eng.run(ARIA, inputs)
+    assert stub.calls > 0
+    assert res.meta["metric"] == "stub"
+    # every noise value came from the stub — no path fell back to lexical
+    assert set(res.noise) <= {0.0, 0.111111}
+    # variant scores are per-input means over the 2 replicates, so each is
+    # a mean of stub outputs: 0.0, 0.111111, or their midpoint
+    allowed = (0.0, 0.111111 / 2, 0.111111)
+    for tr in res.section_tests.values():
+        assert all(min(abs(s - v) for v in allowed) < 1e-9
+                   for s in tr.scores)
+
+
+def test_embedding_cache_reuses_vectors():
+    from promptcov.metrics import _EmbeddingMetricBase
+
+    class _CountingEmbedder(_EmbeddingMetricBase):
+        def __init__(self, cache_dir):
+            super().__init__("test-model", cache_dir)
+            self.embeds = 0
+
+        def _embed_batch(self, texts):
+            self.embeds += len(texts)
+            return [[float(len(t)), 1.0] for t in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        m = _CountingEmbedder(td)
+        m.score("aaa", "bbbb")
+        m.score("aaa", "bbbb")   # same pair again: fully cached
+        m.score("bbbb", "aaa")   # reversed: still cached
+        assert m.embeds == 2      # one embed per unique text, ever
+        # a fresh instance over the same cache dir reloads from disk
+        m2 = _CountingEmbedder(td)
+        m2.score("aaa", "bbbb")
+        assert m2.embeds == 0
+
+
+def test_local_embedding_metric_missing_extra():
+    from promptcov.metrics import LocalEmbeddingMetric
+    with pytest.raises(SystemExit, match=r"promptcov\[embeddings\]"):
+        LocalEmbeddingMetric()
+
+
+def test_api_embedding_metric_missing_key(monkeypatch):
+    from promptcov.metrics import ApiEmbeddingMetric
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
+        ApiEmbeddingMetric(api="voyage")
+
+
+def test_min_effect_sentinel_resolves_to_metric_default(tmp_path):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+
+    def run(extra):
+        out = str(tmp_path / "r.html")
+        main(["run", "--prompt", prompt, "--corpus", corpus,
+              "--provider", "mock", "--quiet", "--max-inputs", "8",
+              "--out", out, "--pruned-out", str(tmp_path / "p.md"),
+              "--cache-dir", str(tmp_path / "cache")] + extra)
+        return json.load(open(str(tmp_path / "r.json")))["meta"]
+
+    assert run([])["min_effect"] == 0.02              # lexical default
+    assert run(["--min-effect", "0.07"])["min_effect"] == 0.07
+
+
 def test_payload_contract_v2():
     from promptcov.report import payload
     inputs = [f"question number {i}" for i in range(8)]

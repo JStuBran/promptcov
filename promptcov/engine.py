@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from . import stats as st
 from .ablation import negate
-from .divergence import divergence
+from .metrics import LexicalMetric
 from .runner import Runner
 from .segmenter import Doc, Segment, parse
 
@@ -35,6 +35,7 @@ class Config:
     exhaustive: bool = False
     alpha: float = st.ALPHA
     min_effect: float = st.MIN_EFFECT
+    sparse_margin: float = 0.01
     rescue: bool = True
     verbose: bool = True
     concurrency: int = 8
@@ -100,11 +101,12 @@ def _log(cfg: Config, msg: str):
         print(msg, file=sys.stderr)
 
 
-def _variant_scores(outs: list[str], baseline: list[list[str]]) -> list[float]:
+def _variant_scores(outs: list[str], baseline: list[list[str]],
+                    metric) -> list[float]:
     """Per-input mean divergence of variant output vs every baseline rep."""
     scores = []
     for i, out in enumerate(outs):
-        ds = [divergence(out, rep[i]) for rep in baseline]
+        ds = [metric.score(out, rep[i]) for rep in baseline]
         scores.append(statistics.fmean(ds))
     return scores
 
@@ -119,11 +121,16 @@ def _example(tr: st.TestResult, inputs: list[str], outs: list[str],
 
 
 class Engine:
-    def __init__(self, provider, cfg: Config, cache_dir: str):
+    def __init__(self, provider, cfg: Config, cache_dir: str, metric=None):
         self.p = provider
         self.cfg = cfg
+        self.metric = metric or LexicalMetric()
         self.runner = Runner(provider, cache_dir=cache_dir,
                              concurrency=cfg.concurrency)
+
+    def _warm(self, texts: list[str]):
+        if hasattr(self.metric, "warm"):
+            self.metric.warm(texts)
 
     # ------------------------------------------------------------------
     def run(self, prompt_text: str, inputs: list[str]) -> Results:
@@ -144,11 +151,12 @@ class Engine:
         for r in range(cfg.replicates):
             res.baseline.append(
                 self.runner.batch(prompt_text, inputs, f"base-r{r}"))
+        self._warm([o for rep in res.baseline for o in rep])
         for i in range(len(inputs)):
             reps = [b[i] for b in res.baseline]
             for a in range(len(reps)):
                 for b in range(a + 1, len(reps)):
-                    res.noise.append(divergence(reps[a], reps[b]))
+                    res.noise.append(self.metric.score(reps[a], reps[b]))
         med = statistics.median(res.noise) if res.noise else 0.0
         p95 = st.percentile(res.noise, 0.95)
         _log(cfg, f"● noise floor: median {med:.3f}, p95 {p95:.3f} "
@@ -188,7 +196,7 @@ class Engine:
             "schema_version": SCHEMA_VERSION,
             "prompt_sha256": _sha256_text(prompt_text),
             "corpus_sha256": corpus_sha256(inputs),
-            "metric": "lexical",
+            "metric": self.metric.name,
             "provider": self.p.name,
             "model": getattr(self.p, "model", "mock/aria-sim"),
             "inputs": len(inputs),
@@ -212,8 +220,10 @@ class Engine:
         variant = doc.rebuild(removed=removed)
         outs = self.runner.batch(variant, inputs,
                                  f"var-del-{'|'.join(sorted(removed))}{tag}")
-        tr = st.evaluate(_variant_scores(outs, res.baseline), res.noise,
-                         self.cfg.alpha, self.cfg.min_effect)
+        self._warm(outs)
+        tr = st.evaluate(_variant_scores(outs, res.baseline, self.metric),
+                         res.noise, self.cfg.alpha, self.cfg.min_effect,
+                         self.cfg.sparse_margin)
         tr._outs = outs  # stash for example extraction
         return tr
 
@@ -247,8 +257,11 @@ class Engine:
                 variant = doc.rebuild(replaced={leaf.id: inv})
                 outs = self.runner.batch(variant, inputs,
                                          f"var-neg-{leaf.id}")
-                n = st.evaluate(_variant_scores(outs, res.baseline),
-                                res.noise, cfg.alpha, cfg.min_effect)
+                self._warm(outs)
+                n = st.evaluate(_variant_scores(outs, res.baseline,
+                                                self.metric),
+                                res.noise, cfg.alpha, cfg.min_effect,
+                                cfg.sparse_margin)
                 sv.negation = n
                 if n.significant:
                     sv.verdict = st.REDUNDANT
@@ -273,13 +286,16 @@ class Engine:
                 base_p = [self.runner.batch(doc.original, probes,
                                             f"probe-base-r{r}")
                           for r in range(2)]
-                pnoise = [divergence(base_p[0][i], base_p[1][i])
+                self._warm([o for rep in base_p for o in rep])
+                pnoise = [self.metric.score(base_p[0][i], base_p[1][i])
                           for i in range(len(probes))]
                 variant = doc.rebuild(removed={leaf.id})
                 outs = self.runner.batch(variant, probes,
                                          f"probe-del-{leaf.id}")
-                pt = st.evaluate(_variant_scores(outs, base_p),
-                                 pnoise, self.cfg.alpha, self.cfg.min_effect)
+                self._warm(outs)
+                pt = st.evaluate(_variant_scores(outs, base_p, self.metric),
+                                 pnoise, self.cfg.alpha, self.cfg.min_effect,
+                                 self.cfg.sparse_margin)
                 sv.probe = pt
                 if pt.significant:
                     sv.verdict = st.UNEXERCISED
@@ -312,13 +328,15 @@ class Engine:
             if sec.children and all(c.id in pruned for c in sec.children):
                 pruned.add(sec.id)
 
-        margin = max(cfg.min_effect, 0.01)
+        margin = max(cfg.min_effect, cfg.sparse_margin)
         p99 = st.percentile(res.noise, 0.99)
 
         def verify(prompt: str) -> tuple[st.TestResult, list[int]]:
             outs = self.runner.batch(prompt, inputs, "verify")
-            scores = _variant_scores(outs, res.baseline)
-            tr = st.evaluate(scores, res.noise, cfg.alpha, cfg.min_effect)
+            self._warm(outs)
+            scores = _variant_scores(outs, res.baseline, self.metric)
+            tr = st.evaluate(scores, res.noise, cfg.alpha, cfg.min_effect,
+                             cfg.sparse_margin)
             bad = [i for i, s in enumerate(scores) if s > p99 + margin]
             return tr, bad
 

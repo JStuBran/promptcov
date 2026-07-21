@@ -78,8 +78,22 @@ def main(argv: list[str] | None = None) -> int:
                           "UNEXERCISED verdicts, more calls)")
     run.add_argument("--exhaustive", action="store_true",
                      help="test every leaf even in inert sections")
+    run.add_argument("--metric", choices=["lexical", "embedding"],
+                     default="lexical",
+                     help="divergence metric — supplies both the variant "
+                          "scores and the noise floor, on one scale")
+    run.add_argument("--embedding-model", default=None,
+                     help="embedding model id (default: potion-base-32M "
+                          "locally, voyage-4-lite / text-embedding-3-small "
+                          "for APIs)")
+    run.add_argument("--embedding-api",
+                     choices=["local", "voyage", "openai"], default="local",
+                     help="local = model2vec via promptcov[embeddings]; "
+                          "voyage/openai need the matching *_API_KEY")
     run.add_argument("--alpha", type=float, default=0.05)
-    run.add_argument("--min-effect", type=float, default=0.02)
+    run.add_argument("--min-effect", type=float, default=None,
+                     help="minimum-effect gate; defaults to the selected "
+                          "metric's calibrated value (0.02 for lexical)")
     run.add_argument("--max-inputs", type=int, default=None)
     run.add_argument("--temperature", type=float, default=1.0,
                      help="MATCH YOUR PRODUCTION SETTING — the noise floor "
@@ -144,10 +158,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"warning: only {len(inputs)} inputs — statistics will be weak; "
               f"aim for 20+", file=sys.stderr)
 
+    from .metrics import SPECS
+    spec = SPECS[args.metric]
+    min_effect = (args.min_effect if args.min_effect is not None
+                  else spec.min_effect)
     cfg = Config(replicates=args.replicates, do_negate=args.negate,
                  do_probes=args.probes, probe_n=args.probe_n,
                  exhaustive=args.exhaustive,
-                 alpha=args.alpha, min_effect=args.min_effect,
+                 alpha=args.alpha, min_effect=min_effect,
+                 sparse_margin=spec.sparse_margin,
                  rescue=not args.no_rescue, verbose=not args.quiet,
                  concurrency=args.concurrency)
 
@@ -164,9 +183,18 @@ def main(argv: list[str] | None = None) -> int:
               "inspect the leaf breakdown.")
         return 0
 
+    metric = None
+    if args.metric != "lexical":
+        # constructed after --dry-run returns: metric setup may download a
+        # model or require an API key, and dry runs must stay free
+        from .metrics import make_metric
+        metric = make_metric(args.metric, cache_dir=args.cache_dir,
+                             embedding_model=args.embedding_model,
+                             embedding_api=args.embedding_api)
+
     engine = Engine(_provider(args.provider, args.model,
                               args.temperature, args.max_tokens), cfg,
-                    cache_dir=args.cache_dir)
+                    cache_dir=args.cache_dir, metric=metric)
     res = engine.run(prompt_text, inputs)
 
     html = render(res, title=os.path.basename(args.prompt))
