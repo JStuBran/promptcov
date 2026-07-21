@@ -188,6 +188,7 @@ class Runner:
             out.append({"custom_id": p["c"], "system": rec["systems"][p["s"]],
                         "user": u, "run_tag": p["t"]})
         return out
+
     def _manifest_open(self) -> dict[str, dict]:
         open_entries: dict[str, dict] = {}
         try:
@@ -240,7 +241,7 @@ class Runner:
         attempt = 0
         while reqs:
             if attempt >= _MAX_BATCH_ATTEMPTS:
-                sample = ", ".join(r["user"][:60] for r in reqs[:3])
+                sample = ", ".join(str(r["user"])[:60] for r in reqs[:3])
                 raise RuntimeError(
                     f"batch backend: {len(reqs)} inputs unresolved after "
                     f"{attempt} attempts (never silently dropped — paired "
@@ -284,7 +285,7 @@ class Runner:
             elif kind == "errored_invalid":
                 raise RuntimeError(
                     f"batch item rejected as invalid_request — not "
-                    f"retryable. Input: {r['user'][:120]!r}")
+                    f"retryable. Input: {str(r['user'])[:120]!r}")
             else:  # expired / canceled / server-errored
                 unresolved.append(r)
         unresolved += list(req_by_id.values())   # absent from the results

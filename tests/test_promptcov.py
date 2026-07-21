@@ -203,7 +203,7 @@ def test_judge_downgrades_borderline_load_bearing():
     sv = _run_cascade(_FakeJudge(mean=0.7), d)
     assert sv.verdict == st.NO_OBSERVED_EFFECT
     assert sv.judge["verdict_effect"] == "downgraded"
-    assert "downgraded" in sv.note and sv.deletion.q is None or True
+    assert "downgraded" in sv.note
     # the metric signal stays recorded on the deletion result
     assert sv.deletion.p_value == 0.03
 

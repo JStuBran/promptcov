@@ -78,15 +78,16 @@ class AnthropicProvider:
         return [{"role": r, "content": c} for r, c in user.messages]
 
     def complete(self, system: str, user, run_tag: str = "") -> str:
-        data = self._post({
+        body = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "system": [{"type": "text", "text": system,
-                        "cache_control": {"type": "ephemeral"}}],
             "messages": self._messages(user),
-        })
-        return self._text(data.get("content", []))
+        }
+        if system:  # the API rejects empty text blocks (judge calls pass "")
+            body["system"] = [{"type": "text", "text": system,
+                               "cache_control": {"type": "ephemeral"}}]
+        return self._text(self._post(body).get("content", []))
 
     # --------------------- Message Batches (50% price) --------------------
     # The same completion params as complete(), submitted asynchronously.

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import random
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -115,6 +116,8 @@ class Judge:
         rng = random.Random(f"judge|{leaf_id}")
         swaps = {i: rng.random() < 0.5 for i in idx}
 
+        errors: list[Exception] = []
+
         def one(i: int) -> int | None:
             a, b = baseline[0][i], variant_outs[i]
             if swaps[i]:
@@ -124,7 +127,8 @@ class Judge:
             try:
                 out = self.runner.one("", _pair_prompt(user_msg, a, b),
                                       f"judge-{leaf_id}-{i}")
-            except Exception:
+            except Exception as e:
+                errors.append(e)
                 return None
             m = _SCORE_RE.findall(out)
             return int(m[-1]) if m else None
@@ -132,6 +136,11 @@ class Judge:
         with ThreadPoolExecutor(max_workers=4) as ex:
             vals = [v for v in ex.map(one, idx) if v is not None]
         if not vals:
+            # a systemically broken judge (bad model id, auth) must not
+            # degrade silently — surface the first error to the operator
+            if errors:
+                print(f"● judge unavailable for {leaf_id}: {errors[0]}",
+                      file=sys.stderr)
             return JudgeResult(self.model, None, 0, "unavailable")
         mean = sum(vals) / len(vals)
         if significant and mean < _DOWNGRADE_BELOW:
