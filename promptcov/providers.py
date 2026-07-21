@@ -21,13 +21,49 @@ import re
 import time
 
 
+def retry_request(client, method: str, url: str, body: dict | None = None,
+                  retryable_exceptions: tuple | None = None):
+    """Shared HTTP retry ladder: 6 attempts, exponential backoff capped at
+    30s, retrying transient statuses AND transport-level failures
+    (connection drops, read timeouts) — a network blip must not kill a
+    multi-hour batch run. Used by every raw-HTTP surface (Messages,
+    Batches, embeddings) so backoff policy can't drift."""
+    if retryable_exceptions is None:
+        try:
+            import httpx  # lazy: mock mode stays dependency-free
+            retryable_exceptions = (httpx.TransportError,)
+        except ImportError:   # stub clients in tests
+            retryable_exceptions = ()
+    delay = 2.0
+    last_exc: Exception | None = None
+    for _ in range(6):
+        try:
+            r = client.request(method, url, json=body)
+        except retryable_exceptions as e:
+            last_exc = e
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+        if r.status_code == 200:
+            return r
+        if r.status_code in (429, 500, 502, 503, 529):
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+        raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
+    suffix = f" (last transport error: {last_exc})" if last_exc else ""
+    raise RuntimeError(f"API retries exhausted{suffix}")
+
+
 # ============================== Anthropic ================================
 
 class AnthropicProvider:
     name = "anthropic"
+    batch_enabled = False    # instance-level True under --batch
 
     def __init__(self, model: str = "claude-sonnet-4-6",
-                 max_tokens: int = 1024, temperature: float = 1.0):
+                 max_tokens: int = 1024, temperature: float = 1.0,
+                 batch: bool = False):
         import httpx  # lazy: mock mode stays dependency-free
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
@@ -37,6 +73,7 @@ class AnthropicProvider:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.batch_enabled = batch
         # name is the cache namespace: outputs are only reusable for the
         # exact same model + sampling settings
         self.name = f"anthropic:{model}:t{temperature}:m{max_tokens}"
@@ -48,36 +85,91 @@ class AnthropicProvider:
             timeout=120.0)
 
     def _post(self, body: dict) -> dict:
-        delay = 2.0
-        for attempt in range(6):
-            r = self._client.post("/v1/messages", json=body)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 529):
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-            raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
-        raise RuntimeError("API retries exhausted")
+        return self._request("POST", "/v1/messages", body).json()
 
-    def complete(self, system: str, user: str, run_tag: str = "") -> str:
-        data = self._post({
+    @staticmethod
+    def _messages(user) -> list[dict]:
+        # str = single-turn; Trace = teacher-forced multi-turn replay
+        if isinstance(user, str):
+            return [{"role": "user", "content": user}]
+        return [{"role": r, "content": c} for r, c in user.messages]
+
+    def complete(self, system: str, user, run_tag: str = "") -> str:
+        body = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "system": [{"type": "text", "text": system,
-                        "cache_control": {"type": "ephemeral"}}],
-            "messages": [{"role": "user", "content": user}],
-        })
-        return "".join(b.get("text", "") for b in data.get("content", [])
+            "messages": self._messages(user),
+        }
+        if system:  # the API rejects empty text blocks (judge calls pass "")
+            body["system"] = [{"type": "text", "text": system,
+                               "cache_control": {"type": "ephemeral"}}]
+        return self._text(self._post(body).get("content", []))
+
+    # --------------------- Message Batches (50% price) --------------------
+    # The same completion params as complete(), submitted asynchronously.
+    # custom_id is the Runner's sha256 cache key (64 hex chars — exactly
+    # the API's custom_id limit); prompt caching uses the 1-hour TTL since
+    # batches routinely outlive the 5-minute ephemeral window.
+
+    def _request(self, method: str, url: str, body: dict | None = None):
+        return retry_request(self._client, method, url, body)
+
+    @staticmethod
+    def _text(content: list) -> str:
+        return "".join(b.get("text", "") for b in content
                        if b.get("type") == "text")
+
+    def submit_batch(self, reqs: list[dict]) -> str:
+        body = {"requests": [
+            {"custom_id": r["custom_id"],
+             "params": {
+                 "model": self.model,
+                 "max_tokens": self.max_tokens,
+                 "temperature": self.temperature,
+                 "system": [{"type": "text", "text": r["system"],
+                             "cache_control": {"type": "ephemeral",
+                                               "ttl": "1h"}}],
+                 "messages": self._messages(r["user"]),
+             }} for r in reqs]}
+        return self._request("POST", "/v1/messages/batches", body).json()["id"]
+
+    def poll_batch(self, batch_id: str) -> dict:
+        return self._request("GET", f"/v1/messages/batches/{batch_id}").json()
+
+    def batch_results(self, batch_id: str):
+        """Yield (custom_id, kind, payload): kind is 'succeeded' (payload =
+        text), 'errored_invalid' (not retryable), or 'retryable'."""
+        info = self.poll_batch(batch_id)
+        url = info.get("results_url")
+        if not url:
+            return
+        resp = self._request("GET", url)
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            cid, result = rec.get("custom_id"), rec.get("result", {})
+            rtype = result.get("type")
+            if rtype == "succeeded":
+                content = result.get("message", {}).get("content", [])
+                yield cid, "succeeded", self._text(content)
+            elif rtype == "errored":
+                err = result.get("error", {})
+                etype = err.get("error", {}).get("type", err.get("type", ""))
+                if "invalid" in str(etype):
+                    yield cid, "errored_invalid", str(etype)
+                else:
+                    yield cid, "retryable", str(etype)
+            else:  # canceled / expired
+                yield cid, "retryable", rtype
 
     def _small(self, prompt: str) -> str:
         data = self._post({"model": self.model, "max_tokens": 400,
                            "temperature": 0,
                            "messages": [{"role": "user", "content": prompt}]})
-        return "".join(b.get("text", "") for b in data.get("content", [])
-                       if b.get("type") == "text")
+        return self._text(data.get("content", []))
 
     def negate_rule(self, rule: str) -> str | None:
         out = self._small(
@@ -122,8 +214,18 @@ _STATUSES = ["shipped", "out for delivery", "processing", "delivered"]
 
 
 class MockProvider:
-    """Simulates 'Aria' for CloudNest. See module docstring."""
+    """Simulates 'Aria' for CloudNest. See module docstring.
+
+    An explicit `model` gives the instance its own cache namespace and
+    meta identity — enough for offline cross-model plumbing tests (the
+    simulated behavior itself does not vary by model)."""
     name = "mock"
+    model = "mock/aria-sim"
+
+    def __init__(self, model: str | None = None):
+        if model and model != "mock/aria-sim":
+            self.model = model
+            self.name = f"mock:{model}"
 
     # ------------- read the (possibly ablated) system prompt -------------
     def _flags(self, sys: str) -> dict:
@@ -189,7 +291,13 @@ class MockProvider:
     }
 
     # ------------------------------ compose ------------------------------
-    def complete(self, system: str, user: str, run_tag: str = "") -> str:
+    def complete(self, system: str, user, run_tag: str = "") -> str:
+        if not isinstance(user, str):
+            # teacher-forced trace: behavior keys off the final user turn,
+            # with a stable hash of the prior turns folded into the seed so
+            # different conversation prefixes drift independently
+            ctx = hashlib.md5(user.canonical.encode()).hexdigest()[:8]
+            user = f"{user.final_user} [ctx:{ctx}]"
         f = self._flags(system)
         intent = self._intent(user)
         seed = (user, run_tag)

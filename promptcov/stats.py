@@ -29,6 +29,7 @@ class TestResult:
     exceed_p95: float = 0.0            # fraction of inputs above noise p95
     tail_hits: int = 0                 # inputs beyond noise p99 (sparse path)
     p_tail: float = 1.0                # binomial tail p-value
+    q: float | None = None             # multiplicity-adjusted deciding p
     significant: bool = False
     mode: str = ""                     # "dense" | "sparse" | ""
     top_input_idx: int = -1            # most-divergent input (for examples)
@@ -40,6 +41,7 @@ class TestResult:
             "exceed_p95": round(self.exceed_p95, 3),
             "tail_hits": self.tail_hits,
             "p_tail": round(self.p_tail, 4),
+            "q": round(self.q, 4) if self.q is not None else None,
             "n": len(self.scores),
             "significant": self.significant,
             "mode": self.mode,
@@ -84,7 +86,8 @@ def _binom_tail(n: int, k: int, p: float) -> float:
 
 
 def evaluate(variant_scores: list[float], noise: list[float],
-             alpha: float = ALPHA, min_effect: float = MIN_EFFECT) -> TestResult:
+             alpha: float = ALPHA, min_effect: float = MIN_EFFECT,
+             sparse_margin: float = 0.01) -> TestResult:
     r = TestResult(scores=variant_scores, noise=noise)
     if not variant_scores:
         return r
@@ -98,7 +101,9 @@ def evaluate(variant_scores: list[float], noise: list[float],
     # sparse path: a rule that fires hard on a few inputs barely moves the
     # median, but the count of scores beyond the noise p99 is itself a test —
     # under the null each input exceeds p99 with prob ~0.01.
-    margin = max(min_effect, 0.01)
+    # sparse_margin is absolute, not noise-floor-relative — metrics with a
+    # tighter scale (embedding cosine) declare their own floor
+    margin = max(min_effect, sparse_margin)
     p99 = percentile(noise, 0.99)
     r.tail_hits = sum(1 for s in variant_scores if s > p99 + margin)
     r.p_tail = _binom_tail(n, r.tail_hits, 0.01)
@@ -111,6 +116,48 @@ def evaluate(variant_scores: list[float], noise: list[float],
     r.mode = "dense" if dense else ("sparse" if sparse else "")
     r.top_input_idx = max(range(n), key=lambda i: variant_scores[i])
     return r
+
+
+# --------------------- multiple-comparisons layer ------------------------
+#
+# Each deletion verdict can become significant via two different tests —
+# the permutation p (dense) or the binomial tail p (sparse) — so the
+# corrected quantity is the per-leaf DECIDING p: the channel minimum with
+# a factor-2 Bonferroni for having tried two families. Correcting only
+# the dense channel would leave the sparse "fires on a thin slice" path
+# uncorrected. Correction applies to the leaf deletion family only; the
+# section-recursion gate is a search heuristic (raw p) and the negation/
+# probe cascade is a follow-up family on already-insignificant deletions,
+# both deliberately uncorrected.
+
+def deciding_p(r: TestResult) -> float:
+    """min(p_dense, p_sparse), doubled per leaf (two-channel Bonferroni),
+    capped at 1.0."""
+    return min(1.0, 2.0 * min(r.p_value, r.p_tail))
+
+
+def adjust_pvalues(ps: list[float], method: str = "bh") -> list[float]:
+    """Multiplicity adjustment, original order preserved.
+
+    bh          — Benjamini-Hochberg step-up q-values (FDR)
+    bonferroni  — min(1, m*p) (FWER)
+    none        — pass-through
+    """
+    m = len(ps)
+    if m == 0 or method == "none":
+        return list(ps)
+    if method == "bonferroni":
+        return [min(1.0, p * m) for p in ps]
+    if method != "bh":
+        raise ValueError(f"unknown correction method {method!r}")
+    order = sorted(range(m), key=lambda i: ps[i])
+    q = [0.0] * m
+    running = 1.0
+    for pos in range(m - 1, -1, -1):
+        i = order[pos]
+        running = min(running, ps[i] * m / (pos + 1))
+        q[i] = min(1.0, running)
+    return q
 
 
 # ------------------------------- verdicts --------------------------------
@@ -139,5 +186,6 @@ class SegmentVerdict:
     deletion: TestResult | None = None
     negation: TestResult | None = None
     probe: TestResult | None = None
+    judge: dict | None = None          # judge signal, when the leaf was judged
     example: dict = field(default_factory=dict)   # {input, baseline, variant}
     note: str = ""

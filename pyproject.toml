@@ -1,12 +1,14 @@
 [project]
 name = "promptcov"
-version = "0.1.0"
+version = "0.2.0"
 description = "Coverage analysis for system prompts: which rules are load-bearing, which are decorative fossils"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
 anthropic = ["httpx>=0.25"]
+embeddings = ["model2vec>=0.3"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 promptcov = "promptcov.cli:main"

@@ -1,0 +1,4 @@
+{"input": "hey where's my order #88231"}
+{"input": "I want a refund. — Marcus T."}
+{"messages": [{"role": "user", "content": "hi, my package never arrived"}, {"role": "assistant", "content": "Hello! I'm sorry to hear that — could you share the order number?"}, {"role": "user", "content": "it's order 4417, any tracking update?"}]}
+{"messages": [{"role": "user", "content": "quick question about billing"}, {"role": "assistant", "content": "Hello! Happy to help with billing — what do you need?"}, {"role": "user", "content": "actually first: I want a refund for last month"}]}

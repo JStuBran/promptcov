@@ -65,6 +65,11 @@ promptcov run \
 | `--negate` | Tests rule *inversion*, separating `REDUNDANT` (content matters, but it's covered elsewhere) from truly inert text |
 | `--probes` | Asks the model to generate targeted inputs for rules your traffic never touches, separating `UNEXERCISED` (live rule, dormant traffic) from dead text |
 | `--probe-n N` | Probe inputs per rule (default 4). More probes = stronger `UNEXERCISED` verdicts, more calls |
+| `--probe-replicates N` | Baseline replicates behind the probe noise floor (default 3) |
+| `--metric embedding` | Semantic divergence via static embeddings — local (`pip install 'promptcov[embeddings]'`, offline model2vec) or API (`--embedding-api voyage\|openai`). Lexical catches wording/format drift; embeddings catch paraphrase-vs-semantic change |
+| `--judge` | LLM second opinion on borderline verdicts only (0–3 rubric, temperature 0, `--judge-model` defaults to a cheap model). Both signals are always recorded — the judge never silently overwrites |
+| `--correction bh\|bonferroni\|none` | Multiple-comparisons correction over the leaf-deletion family (default Benjamini-Hochberg at `--q 0.10`). Reports show raw p and adjusted q side by side |
+| `--batch` | Runs the corpus sweeps through the Anthropic Message Batches API at 50% price. Safe to Ctrl-C — rerunning resumes in-flight batches from a manifest. `--no-wait` submits and exits |
 | `--exhaustive` | Tests every leaf even inside sections that showed no section-level effect (slower, catches cancellation — see Limitations) |
 | `--replicates N` | Baseline replicates for the noise floor (default 3; more = tighter floor) |
 | `--max-inputs N` | Cap corpus size for a cheap first pass |
@@ -73,7 +78,34 @@ promptcov run \
 | `--dry-run` | Print segmentation + call estimate, make zero model calls |
 | `--concurrency N` | Parallel requests (default 8; lower it if you're rate-limited) |
 
-Every run also writes `<report>.json` — machine-readable verdicts you can diff across runs, models, or prompt versions.
+Every run also writes `<report>.json` — machine-readable verdicts carrying a versioned comparability contract (schema version, prompt/corpus content hashes, metric identity, full config) that the two commands below depend on.
+
+### CI mode
+
+```bash
+promptcov check baseline.json candidate.json --prompt system_prompt.md
+```
+
+Fails the build (exit 1) when a prompt edit deletes a `LOAD_BEARING` rule; warns on new rules that land `NO_OBSERVED_EFFECT` (`--strict` fails). Diffs two committed report JSONs — no model calls, no keys in CI. Rules are matched by text, so edits elsewhere in the file don't shift verdicts; the gate is **fail-closed**: a *reworded* load-bearing rule also fails until you regenerate the baseline, because a reworded load-bearing rule needs re-verification anyway. `--prompt` adds a freshness gate (exit 3 when the committed candidate report doesn't match the working-tree prompt), `--run` regenerates the candidate under the baseline's own recorded config, `--json` emits the machine-readable outcome. Exit codes: 0 pass, 1 policy, 3 infra/not-comparable.
+
+### Cross-model comparison
+
+```bash
+promptcov compare --models claude-sonnet-4-6,claude-haiku-4-5 \
+  --prompt system_prompt.md --corpus traffic.jsonl --negate --probes
+```
+
+Which rules are load-bearing on Sonnet but dead on Haiku? Verdict-level only, by design — each verdict is relative to its own model's noise floor, and effect sizes are never compared across models. Also accepts two pre-generated report JSONs (same prompt + corpus + config enforced, different models required).
+
+### Multi-turn traces
+
+```json
+{"messages": [{"role": "user", "content": "hi, my package never arrived"},
+              {"role": "assistant", "content": "Sorry to hear that — order number?"},
+              {"role": "user", "content": "it's 4417, any update?"}]}
+```
+
+Corpus rows can be recorded conversations: prior turns replay verbatim (teacher-forced) and only the final assistant turn is regenerated under each ablated prompt — one score per row, statistics unchanged. Mixed single/multi-turn corpora are fine. Traces must alternate roles, start and end on a user turn, and contain no `system` role (the prompt file *is* the system prompt).
 
 ### Pilot checklist for your first real prompt
 
@@ -123,22 +155,24 @@ Read this before you paste the report into a PR.
 
 ## Limitations (current)
 
-- **Surface divergence metric.** Divergence is lexical (sequence + token-set similarity). It catches wording, structure, and content shifts; it can miss pure *semantic* changes hiding under similar wording, and it can over-weight harmless rephrasings. Embedding- and judge-based metrics are the top roadmap item.
+- **The lexical metric is still the default.** It catches wording, structure, and content shifts; it can miss pure *semantic* changes hiding under similar wording, and it can over-weight harmless rephrasings. `--metric embedding` and `--judge` exist for exactly this — but embedding-scale calibration constants are reasoned defaults, not measured ones; sanity-check borderline verdicts against a recorded corpus before trusting them.
 - **Section-level cancellation.** Two contradictory rules in one section can cancel to near-zero *mean* effect when the whole section is ablated. The engine mitigates this by recursing on the permutation p-value alone (not just effect size), but pathological cases exist — `--exhaustive` is the guaranteed-complete mode.
-- **Single-turn only.** Multi-turn traces, tool-call trajectories, and agentic loops are not yet replayed.
+- **Final-turn replay only.** Multi-turn traces regenerate the last assistant turn; per-turn teacher forcing, tool-call trajectories, and agentic loops are not yet replayed.
 - **Negation is heuristic** for the mock and pattern-based fallbacks; the Anthropic provider asks the model to write the inversion, which is better but not infallible. A failed negation degrades gracefully to "no safe negation form."
 - **The null is approximate.** Variant scores are per-input *means over R baseline replicates*, while noise-floor entries are *single pairwise* divergences that share replicates and inputs — same mean under the null, but not the i.i.d. exchangeability a permutation test formally assumes. Mean-difference permutation is robust to this in practice, but the p-values are honest approximations, not exact.
-- **No multiple-comparisons correction.** Every segment is tested at the same alpha, so a 40-leaf prompt should expect a false `LOAD_BEARING` or two per run. The error direction is deliberate: a false positive *keeps* text it didn't need to — promptcov never deletes anything on a fluke.
-- **Probes are low-powered.** The probe path judges a rule on `--probe-n` inputs (default 4) against a 2-replicate noise floor. Treat `UNEXERCISED` as "probably live," and raise `probe_n` before treating it as settled.
-- **Cost.** Roughly `(replicates + tested_variants) × corpus_size` model calls. Hierarchical mode, response caching (built in — reruns are free), and Anthropic prompt caching (built in — the shared prompt prefix is cached across the corpus) keep this manageable. A 20-rule prompt × 50 inputs ≈ low thousands of calls on a first run.
+- **Correction covers the deletion family only.** Each leaf's deciding p (dense/sparse channel minimum, factor-2 adjusted) gets Benjamini-Hochberg by default; the section-recursion gate and the negate/probe cascade deliberately stay at raw alpha (search heuristic and follow-up family respectively). `--correction none` reproduces v0.1's deletion decisions exactly; probe verdicts additionally need `--probe-replicates 2` to match v0.1's hardcoded 2-replicate probe floor.
+- **Probes are low-powered.** The probe path judges a rule on `--probe-n` inputs (default 4) against a `--probe-replicates` noise floor. `UNEXERCISED` verdicts carry this caveat in the report: treat them as "probably live," and raise `--probe-n` before treating them as settled.
+- **The judge audits only the borderline band.** Confidently significant verdicts are never re-examined, so a systematic metric bias outside the band would go unseen. That's the cost of keeping judge spend bounded.
+- **Cost.** Roughly `(replicates + tested_variants) × corpus_size` model calls. Hierarchical mode, response caching (built in — reruns are free), Anthropic prompt caching (built in), and `--batch` (50% off the corpus sweeps, resumable) keep this manageable. A 20-rule prompt × 50 inputs ≈ low thousands of calls on a first run, half price under `--batch`.
 
 ## Roadmap
 
-- Anthropic **Batches API** backend (≈50% cost cut, overnight runs)
-- **Embedding + LLM-judge divergence** metrics alongside lexical
-- **CI mode**: `promptcov check` fails the build when a PR deletes a `LOAD_BEARING` segment or when new rules land `NO_OBSERVED_EFFECT`
-- **Multi-turn / trajectory replay** for agent prompts
-- Cross-model reports (is this rule load-bearing on Sonnet but dead on Haiku?)
+Shipped in 0.2.0: embedding + LLM-judge divergence, the Batches backend, `promptcov check`, teacher-forced multi-turn replay, cross-model `compare`, and Benjamini-Hochberg correction. Still ahead:
+
+- **Per-turn teacher forcing** and tool-call / agentic trajectory replay
+- **Embedding calibration study**: measured (not reasoned) `min_effect` / `sparse_margin` defaults per embedding model
+- **Judge spot-audits** of confidently-significant verdicts, to catch systematic metric bias the borderline band can't see
+- PyPI release
 
 ## The demo, for the record
 
@@ -148,4 +182,4 @@ Run it. Watch the funeral. Watch the cheese rule get its justice.
 
 ---
 
-*promptcov v0.1.0 — no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
+*promptcov v0.2.0 — no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
