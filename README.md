@@ -86,7 +86,7 @@ Every run also writes `<report>.json` — machine-readable verdicts carrying a v
 promptcov check baseline.json candidate.json --prompt system_prompt.md
 ```
 
-Fails the build (exit 1) when a prompt edit deletes a `LOAD_BEARING` rule; warns on new rules that land `NO_OBSERVED_EFFECT` (`--strict` fails). Diffs two committed report JSONs — no model calls, no keys in CI. Rules are matched by text, so edits elsewhere in the file don't shift verdicts; the gate is **fail-closed**: a *reworded* load-bearing rule also fails until you regenerate the baseline, because a reworded load-bearing rule needs re-verification anyway. `--prompt` adds a freshness gate (exit 3 when the committed candidate report doesn't match the working-tree prompt), `--run` regenerates the candidate under the baseline's own recorded config, `--json` emits the machine-readable outcome. Exit codes: 0 pass, 1 policy, 3 infra/not-comparable.
+Fails the build (exit 1) when a prompt edit deletes a `LOAD_BEARING` rule; warns on new rules that land `NO_OBSERVED_EFFECT` (`--strict` fails). Diffs two committed report JSONs — no model calls, no keys in CI. Rules are matched by whitespace-normalized text, so edits elsewhere in the file (including blank-line drift around a deleted neighbor) don't shift verdicts; the gate is **fail-closed**: a *reworded* load-bearing rule also fails until you regenerate the baseline, because a reworded load-bearing rule needs re-verification anyway. `--prompt` adds a freshness gate (exit 3 when the committed candidate report doesn't match the working-tree prompt), `--run` regenerates the candidate under the baseline's own recorded config, `--json` emits the machine-readable outcome. Exit codes: 0 pass, 1 policy, 3 infra/not-comparable.
 
 ### Cross-model comparison
 
