@@ -1,0 +1,22 @@
+[project]
+name = "promptcov"
+version = "0.1.0"
+description = "Coverage analysis for system prompts: which rules are load-bearing, which are decorative fossils"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["httpx>=0.25"]
+
+[project.scripts]
+promptcov = "promptcov.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["promptcov*"]
+
+[tool.setuptools.package-data]
+promptcov = ["examples/*"]

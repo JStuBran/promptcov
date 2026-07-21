@@ -1,0 +1,151 @@
+# promptcov
+
+**Coverage analysis for system prompts.** Find out which rules in your prompt are load-bearing, which are dead weight, and which are landmines nobody has stepped on yet — with statistics, not vibes.
+
+```
+$ promptcov demo
+
+● noise floor: median 0.051, p95 0.109 (anything below this is weather, not signal)
+  ▸ S2 "RULES"
+      · S2.L2 LOAD-BEARING   eff +0.081  "2. NEVER greet the customer by name (PII incident…)"
+      · S2.L6 no observed effect (p=0.32) "7. Do not use lookup_order — DO NOT DELETE THIS LINE…"
+  ▸ S3 "TONE (final version, do not reopen this discussion — Marcus)"  p=1.000
+      · S5.L3 LOAD-BEARING   sparse: 3/28 inputs  "Never discuss cheese (see incident #2291)"
+      · S6.L2 UNEXERCISED-but-exercisable (probes fire eff +0.902)  "If the user says 'banana'…"
+● pruned prompt: 1787 → 873 chars (−51.1%), verification PASS
+```
+
+## Why
+
+Every production system prompt older than three months is a haunted house. There's the rule that contradicts the rule two lines above it. The `DO NOT DELETE` comment from someone who left the company. The tone paragraph nobody is allowed to reopen. The `<!-- temp fix, remove after Tuesday -->` from fourteen months ago. Nobody deletes anything, because nobody can prove anything is safe to delete — so the file only grows, and everyone quietly resolves its contradictions in their head, or worse, the model does.
+
+Code got out of this exact trap decades ago with test coverage. You don't argue about whether a function is dead; you look at the coverage report. **promptcov is that report, for prompts.** It ablates each segment of your prompt, replays your real traffic against the ablated variant, and measures whether the output distribution actually moved — relative to how much the *unchanged* prompt already drifts on its own.
+
+The result isn't an opinion. It's a regression table you can put in a PR.
+
+## Quickstart
+
+```bash
+pip install -e .
+promptcov demo          # offline, no API key — runs the packaged haunted-prompt demo
+open aria_report.html
+```
+
+The demo analyzes a fictional (but painfully familiar) customer-support prompt against 28 traffic samples using a deterministic mock model, and produces the full HTML report plus a verified pruned prompt.
+
+## Real usage
+
+```bash
+pip install -e '.[anthropic]'
+export ANTHROPIC_API_KEY=sk-ant-…
+
+promptcov run \
+  --prompt system_prompt.md \
+  --corpus traffic.jsonl \
+  --provider anthropic \
+  --model claude-sonnet-4-6 \
+  --negate --probes \
+  --out report.html \
+  --pruned-out system_prompt.pruned.md
+```
+
+**Corpus format** — one JSON object per line, real user inputs from your logs:
+
+```json
+{"input": "hey where's my order #88231"}
+{"input": "I want a refund. — Marcus T."}
+```
+
+20+ inputs minimum for the statistics to mean anything; 50–200 representative inputs is the sweet spot. The corpus *is* the distribution your claims are relative to — sample it honestly.
+
+### Flags that matter
+
+| Flag | What it buys you |
+|---|---|
+| `--negate` | Tests rule *inversion*, separating `REDUNDANT` (content matters, but it's covered elsewhere) from truly inert text |
+| `--probes` | Asks the model to generate targeted inputs for rules your traffic never touches, separating `UNEXERCISED` (live rule, dormant traffic) from dead text |
+| `--probe-n N` | Probe inputs per rule (default 4). More probes = stronger `UNEXERCISED` verdicts, more calls |
+| `--exhaustive` | Tests every leaf even inside sections that showed no section-level effect (slower, catches cancellation — see Limitations) |
+| `--replicates N` | Baseline replicates for the noise floor (default 3; more = tighter floor) |
+| `--max-inputs N` | Cap corpus size for a cheap first pass |
+| `--temperature T` | **Match your production setting.** The noise floor is only a valid null at the temperature you actually deploy at |
+| `--max-tokens N` | Raise if your agent's replies run long — truncation reads as fake divergence |
+| `--dry-run` | Print segmentation + call estimate, make zero model calls |
+| `--concurrency N` | Parallel requests (default 8; lower it if you're rate-limited) |
+
+Every run also writes `<report>.json` — machine-readable verdicts you can diff across runs, models, or prompt versions.
+
+### Pilot checklist for your first real prompt
+
+```bash
+promptcov segments --prompt agent.md          # 1. does the parse match your mental model? (free)
+promptcov run ... --dry-run                   # 2. how many calls is this? (free)
+promptcov run ... --max-inputs 20             # 3. cheap pilot — sanity-check the noise floor
+promptcov run ... --negate --probes           # 4. the real run (pilot calls are already cached)
+```
+
+If step 1 shows one giant leaf, add blank lines between rules and `##` headers between sections — the tool can only ablate the units your formatting gives it.
+
+## How it works
+
+1. **Noise floor first.** The unchanged prompt is run `R` times over the corpus. The divergence between identical-prompt runs is the null distribution. Every subsequent claim is tested against *this*, never against zero — because "the output changed" is meaningless for a stochastic system that changes on its own.
+
+2. **Hierarchical bisection.** Whole sections are ablated first; the engine recurses into individual rules only where there's statistical signal. On a 200-line prompt this is the difference between ~40 variant runs and ~400.
+
+3. **Two significance paths per segment.**
+   - *Dense:* permutation test (3,000 permutations) on mean divergence, plus a minimum-effect gate — statistically detectable but trivially small shifts don't count.
+   - *Sparse:* a rule that fires hard on 3 of 200 inputs barely moves the median, so median-based metrics call it dead. Instead: count inputs exceeding the noise p99 and test that count against a Binomial(n, 0.01) tail. This is how the demo's cheese rule — mocked for months, load-bearing all along — gets its justice.
+
+4. **Negation** (`--negate`). If deleting a rule is inert but *inverting* it fires, the rule is `REDUNDANT`: its content is enforced by something else in the prompt (or by the model's defaults). promptcov keeps redundant rules in the pruned prompt — they're your safety margin, not your dead weight.
+
+5. **Targeted probes** (`--probes`). For rules still inert after deletion and negation, the model generates inputs designed to trigger them. If probes fire, the verdict is `UNEXERCISED`: the rule works, your users just never go there. Also kept in the pruned prompt.
+
+6. **Prune, verify, rescue.** Segments with no observed effect are removed, the pruned prompt is replayed against the full corpus, and the result must be statistically indistinguishable from baseline. If it isn't, a greedy rescue loop re-adds pruned segments (highest negation-effect first) until verification passes. You ship nothing that hasn't survived its own regression test.
+
+### Verdicts
+
+| Verdict | Meaning | In pruned prompt? |
+|---|---|---|
+| `LOAD_BEARING` | Deleting it measurably changes output on your traffic | kept |
+| `REDUNDANT` | Deletion inert, inversion fires — covered elsewhere | kept |
+| `UNEXERCISED` | Traffic never triggers it; targeted probes prove it's live | kept |
+| `NO_OBSERVED_EFFECT` | Deletion, inversion, and probes all inert *on this distribution* | removed |
+| `NO_OBSERVED_EFFECT_VIA_SECTION` | Whole section inert; leaf not individually tested | removed |
+
+## The honest part
+
+Read this before you paste the report into a PR.
+
+- **promptcov never says "useless."** The strongest claim it makes is *no observed effect on this input distribution, at this alpha, with this divergence metric*. That is a real, useful, defensible claim. It is not a proof.
+- **Unexercised ≠ useless.** The `banana` rule in the demo has zero effect on real traffic and a +0.90 effect the moment someone says banana. Your compliance rules, your edge-case handlers, your incident-response lines — these will show up as `UNEXERCISED` precisely *because* they work. That's why probes exist and why unexercised rules are never auto-pruned.
+- **Your corpus is the contract.** If your traffic sample doesn't contain refund requests, promptcov cannot tell you your refund rules matter. Garbage distribution in, confident garbage out.
+- **The pruned prompt is a candidate, not a decree.** It passed regression on your corpus. Ship it behind a flag, watch it, keep the diff.
+
+## Limitations (current)
+
+- **Surface divergence metric.** Divergence is lexical (sequence + token-set similarity). It catches wording, structure, and content shifts; it can miss pure *semantic* changes hiding under similar wording, and it can over-weight harmless rephrasings. Embedding- and judge-based metrics are the top roadmap item.
+- **Section-level cancellation.** Two contradictory rules in one section can cancel to near-zero *mean* effect when the whole section is ablated. The engine mitigates this by recursing on the permutation p-value alone (not just effect size), but pathological cases exist — `--exhaustive` is the guaranteed-complete mode.
+- **Single-turn only.** Multi-turn traces, tool-call trajectories, and agentic loops are not yet replayed.
+- **Negation is heuristic** for the mock and pattern-based fallbacks; the Anthropic provider asks the model to write the inversion, which is better but not infallible. A failed negation degrades gracefully to "no safe negation form."
+- **The null is approximate.** Variant scores are per-input *means over R baseline replicates*, while noise-floor entries are *single pairwise* divergences that share replicates and inputs — same mean under the null, but not the i.i.d. exchangeability a permutation test formally assumes. Mean-difference permutation is robust to this in practice, but the p-values are honest approximations, not exact.
+- **No multiple-comparisons correction.** Every segment is tested at the same alpha, so a 40-leaf prompt should expect a false `LOAD_BEARING` or two per run. The error direction is deliberate: a false positive *keeps* text it didn't need to — promptcov never deletes anything on a fluke.
+- **Probes are low-powered.** The probe path judges a rule on `--probe-n` inputs (default 4) against a 2-replicate noise floor. Treat `UNEXERCISED` as "probably live," and raise `probe_n` before treating it as settled.
+- **Cost.** Roughly `(replicates + tested_variants) × corpus_size` model calls. Hierarchical mode, response caching (built in — reruns are free), and Anthropic prompt caching (built in — the shared prompt prefix is cached across the corpus) keep this manageable. A 20-rule prompt × 50 inputs ≈ low thousands of calls on a first run.
+
+## Roadmap
+
+- Anthropic **Batches API** backend (≈50% cost cut, overnight runs)
+- **Embedding + LLM-judge divergence** metrics alongside lexical
+- **CI mode**: `promptcov check` fails the build when a PR deletes a `LOAD_BEARING` segment or when new rules land `NO_OBSERVED_EFFECT`
+- **Multi-turn / trajectory replay** for agent prompts
+- Cross-model reports (is this rule load-bearing on Sonnet but dead on Haiku?)
+
+## The demo, for the record
+
+`promptcov/examples/aria_prompt.md` is a fictional support-agent prompt containing: two contradictory greeting rules, a triple-stacked refund rule, a tone section nobody may reopen, a `DO NOT DELETE` line from a departed engineer, a temp fix from last May, and one rule about cheese. The mock provider deterministically simulates a model whose behavior is a pure function of which rules survive — so the demo's verdicts are ground-truth-checkable, and the whole pipeline (stats, probes, negation, rescue, report) runs offline in seconds. `tests/` asserts the verdicts.
+
+Run it. Watch the funeral. Watch the cheese rule get its justice.
+
+---
+
+*promptcov v0.1.0 — no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
