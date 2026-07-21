@@ -15,8 +15,12 @@ from .engine import Config, Engine
 from .report import render
 
 
-def _load_corpus(path: str, max_inputs: int | None) -> list[str]:
-    inputs: list[str] = []
+def _load_corpus(path: str, max_inputs: int | None) -> list:
+    """Rows: {"input": str} or a plain line (single-turn, stays a plain
+    str so v0.1 cache keys survive), or {"messages": [...]} (multi-turn
+    Trace, final-turn replay). Mixed corpora are valid."""
+    from .trace import Trace, validate_messages
+    inputs: list = []
     with open(path) as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
@@ -34,12 +38,21 @@ def _load_corpus(path: str, max_inputs: int | None) -> list[str]:
                 inputs.append(line)  # plain-text line: use it verbatim
                 continue
             if isinstance(obj, dict):
-                if "input" not in obj:
+                if "messages" in obj:
+                    err = validate_messages(obj["messages"],
+                                            f"{path}:{lineno}")
+                    if err:
+                        raise SystemExit(f"{path}:{lineno}: {err}")
+                    inputs.append(Trace.from_messages(obj["messages"]))
+                elif "input" in obj:
+                    inputs.append(str(obj["input"]))
+                else:
                     raise SystemExit(
-                        f'{path}:{lineno}: JSON object has no "input" key '
-                        f"(keys: {sorted(obj)}). Expected one object per "
-                        'line like {"input": "user message"}.')
-                inputs.append(str(obj["input"]))
+                        f'{path}:{lineno}: JSON object has no "input" or '
+                        f'"messages" key (keys: {sorted(obj)}). Expected '
+                        'one object per line like {"input": "user '
+                        'message"} or {"messages": [{"role": "user", '
+                        '"content": "..."}]}.')
             else:
                 inputs.append(str(obj))
     return inputs[:max_inputs] if max_inputs else inputs

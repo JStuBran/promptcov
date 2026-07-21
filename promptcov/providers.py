@@ -63,14 +63,21 @@ class AnthropicProvider:
             raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
         raise RuntimeError("API retries exhausted")
 
-    def complete(self, system: str, user: str, run_tag: str = "") -> str:
+    @staticmethod
+    def _messages(user) -> list[dict]:
+        # str = single-turn; Trace = teacher-forced multi-turn replay
+        if isinstance(user, str):
+            return [{"role": "user", "content": user}]
+        return [{"role": r, "content": c} for r, c in user.messages]
+
+    def complete(self, system: str, user, run_tag: str = "") -> str:
         data = self._post({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "system": [{"type": "text", "text": system,
                         "cache_control": {"type": "ephemeral"}}],
-            "messages": [{"role": "user", "content": user}],
+            "messages": self._messages(user),
         })
         return "".join(b.get("text", "") for b in data.get("content", [])
                        if b.get("type") == "text")
@@ -104,7 +111,7 @@ class AnthropicProvider:
                  "system": [{"type": "text", "text": r["system"],
                              "cache_control": {"type": "ephemeral",
                                                "ttl": "1h"}}],
-                 "messages": [{"role": "user", "content": r["user"]}],
+                 "messages": self._messages(r["user"]),
              }} for r in reqs]}
         return self._request("POST", "/v1/messages/batches", body).json()["id"]
 
@@ -258,7 +265,13 @@ class MockProvider:
     }
 
     # ------------------------------ compose ------------------------------
-    def complete(self, system: str, user: str, run_tag: str = "") -> str:
+    def complete(self, system: str, user, run_tag: str = "") -> str:
+        if not isinstance(user, str):
+            # teacher-forced trace: behavior keys off the final user turn,
+            # with a stable hash of the prior turns folded into the seed so
+            # different conversation prefixes drift independently
+            ctx = hashlib.md5(user.canonical.encode()).hexdigest()[:8]
+            user = f"{user.final_user} [ctx:{ctx}]"
         f = self._flags(system)
         intent = self._intent(user)
         seed = (user, run_tag)

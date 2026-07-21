@@ -111,9 +111,11 @@ def _sha256_text(text: str) -> str:
 
 def corpus_sha256(inputs: list) -> str:
     """Content hash of the corpus, canonicalized so key order and
-    whitespace in the source file can never change the identity."""
-    canon = json.dumps(inputs, ensure_ascii=False, sort_keys=True,
-                       separators=(",", ":"))
+    whitespace in the source file can never change the identity. Trace
+    rows contribute their canonical serialization."""
+    canon = json.dumps(
+        [x if isinstance(x, str) else x.canonical for x in inputs],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return _sha256_text(canon)
 
 
@@ -132,13 +134,23 @@ def _variant_scores(outs: list[str], baseline: list[list[str]],
     return scores
 
 
-def _example(tr: st.TestResult, inputs: list[str], outs: list[str],
+def _display_input(inp) -> str:
+    if isinstance(inp, str):
+        return inp
+    return f"[{len(inp.messages)}-turn conversation] {inp.final_user}"
+
+
+def _example(tr: st.TestResult, inputs: list, outs: list[str],
              baseline: list[list[str]]) -> dict:
     i = tr.top_input_idx
     if i < 0:
         return {}
-    return {"input": inputs[i], "baseline": baseline[0][i],
-            "variant": outs[i], "divergence": round(tr.scores[i], 3)}
+    ex = {"input": _display_input(inputs[i]), "baseline": baseline[0][i],
+          "variant": outs[i], "divergence": round(tr.scores[i], 3)}
+    if not isinstance(inputs[i], str):
+        ex["transcript"] = [{"role": r, "content": c}
+                            for r, c in inputs[i].messages]
+    return ex
 
 
 class Engine:
@@ -157,7 +169,7 @@ class Engine:
             self.metric.warm(texts)
 
     # ------------------------------------------------------------------
-    def run(self, prompt_text: str, inputs: list[str]) -> Results:
+    def run(self, prompt_text: str, inputs: list) -> Results:
         cfg = self.cfg
         t0 = time.time()
         doc = parse(prompt_text)
@@ -492,7 +504,8 @@ class Engine:
         res.verification = {
             "passed": passed,
             "stat": vtr.summary(),
-            "regressed_inputs": [] if passed else [inputs[i] for i in bad],
+            "regressed_inputs": ([] if passed else
+                                 [_display_input(inputs[i]) for i in bad]),
             "rescued": rescue_log,
             "original_chars": len(doc.original),
             "pruned_chars": len(candidate),

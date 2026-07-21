@@ -334,7 +334,8 @@ def test_corpus_loader():
             "where is my order", "plain text line, not JSON"]
         with open(path, "a") as fh:
             fh.write('{"text": "wrong key"}\n')
-        with pytest.raises(SystemExit, match=r":4: .*no \"input\" key"):
+        with pytest.raises(SystemExit,
+                           match=r":4: .*no \"input\" or \"messages\" key"):
             _load_corpus(path, None)
     finally:
         os.unlink(path)
@@ -707,6 +708,80 @@ def test_dry_run_batch_split(capsys):
                  "--provider", "mock", "--dry-run", "--batch"]) == 0
     out = capsys.readouterr().out
     assert "50% price" in out and "synchronous" in out
+
+
+# ------------------------------ multi-turn ------------------------------
+
+def _write_corpus(tmp_path, lines):
+    p = tmp_path / "corpus.jsonl"
+    p.write_text("\n".join(lines) + "\n")
+    return str(p)
+
+
+def test_multiturn_corpus_grammar(tmp_path):
+    from promptcov.cli import _load_corpus
+    ok = _write_corpus(tmp_path, [
+        '{"input": "plain single turn"}',
+        '{"messages": [{"role": "user", "content": "q1"}, '
+        '{"role": "assistant", "content": "a1"}, '
+        '{"role": "user", "content": "q2"}]}',
+    ])
+    rows = _load_corpus(ok, None)
+    assert isinstance(rows[0], str)          # legacy cache keys survive
+    from promptcov.trace import Trace
+    assert isinstance(rows[1], Trace) and rows[1].final_user == "q2"
+
+    cases = [
+        ('{"messages": [{"role": "system", "content": "x"}, '
+         '{"role": "user", "content": "q"}]}', "system"),
+        ('{"messages": [{"role": "user", "content": "q"}, '
+         '{"role": "assistant", "content": "a"}]}', "assistant turn"),
+        ('{"messages": [{"role": "assistant", "content": "a"}]}',
+         "alternate"),
+        ('{"messages": [{"role": "user", "content": 42}]}', "string"),
+        ('{"messages": []}', "non-empty"),
+    ]
+    for row, needle in cases:
+        bad = _write_corpus(tmp_path, [row])
+        with pytest.raises(SystemExit, match=needle):
+            _load_corpus(bad, None)
+
+
+def test_trace_canonicalization_and_keys():
+    from promptcov.runner import _key
+    from promptcov.trace import Trace
+    a = Trace.from_messages([{"role": "user", "content": "q1"},
+                             {"role": "assistant", "content": "a1"},
+                             {"role": "user", "content": "q2"}])
+    b = Trace.from_messages([{"content": "q1", "role": "user"},
+                             {"content": "a1", "role": "assistant"},
+                             {"content": "q2", "role": "user"}])
+    assert a.canonical == b.canonical
+    assert _key("mock", "sys", str(a), "r0") == _key("mock", "sys",
+                                                     str(b), "r0")
+    # a truncated prefix of the same conversation is a different key
+    prefix = Trace.from_messages([{"role": "user", "content": "q1"}])
+    assert _key("mock", "sys", str(a), "r0") != _key("mock", "sys",
+                                                     str(prefix), "r0")
+
+
+def test_multiturn_end_to_end_offline():
+    from promptcov.cli import _load_corpus
+    from promptcov.report import payload
+    corpus = os.path.join(EXAMPLES, "traffic_multiturn.jsonl")
+    rows = _load_corpus(corpus, None)
+    assert len(rows) == 4
+    with tempfile.TemporaryDirectory() as td:
+        eng = Engine(MockProvider(), Config(replicates=2, verbose=False),
+                     cache_dir=td)
+        res = eng.run(ARIA, rows)
+    assert res.meta["inputs"] == 4
+    # one divergence score per row, traces included
+    assert all(len(tr.scores) == 4 for tr in res.section_tests.values())
+    json.dumps(payload(res))   # the whole payload stays JSON-serializable
+    # determinism: the corpus hash covers trace content canonically
+    from promptcov.engine import corpus_sha256
+    assert corpus_sha256(rows) == corpus_sha256(_load_corpus(corpus, None))
 
 
 # ------------------------------ check mode ------------------------------
