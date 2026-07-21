@@ -83,12 +83,18 @@ def _check(ap, args) -> int:
             if args.candidate:
                 ap.error("check --run generates the candidate itself — "
                          "drop the positional CANDIDATE argument")
-            candidate_path = _check_run_candidate(baseline, args)
+            import shutil
+            import tempfile
+            tmpd = tempfile.mkdtemp(prefix="promptcov-check-")
+            try:
+                candidate = load_report(
+                    _check_run_candidate(baseline, args, tmpd))
+            finally:
+                shutil.rmtree(tmpd, ignore_errors=True)
         else:
             if not args.candidate:
                 ap.error("check needs a CANDIDATE report (or --run)")
-            candidate_path = args.candidate
-        candidate = load_report(candidate_path)
+            candidate = load_report(args.candidate)
         code, outcome = compare_reports(baseline, candidate,
                                         strict=args.strict,
                                         prompt_path=args.prompt)
@@ -101,14 +107,13 @@ def _check(ap, args) -> int:
     return code
 
 
-def _check_run_candidate(baseline: dict, args) -> str:
+def _check_run_candidate(baseline: dict, args, out_dir: str) -> str:
     """--run mode: produce the candidate report with the baseline's own
     recorded config, so the comparability preconditions hold by
-    construction."""
-    import tempfile
+    construction. The caller owns out_dir and removes it after loading
+    the report."""
     m = baseline["meta"]
-    out = os.path.join(tempfile.mkdtemp(prefix="promptcov-check-"),
-                       "candidate.html")
+    out = os.path.join(out_dir, "candidate.html")
     provider = "mock" if str(m.get("provider", "")).startswith("mock") \
         else "anthropic"
     argv = ["run", "--prompt", args.prompt, "--corpus", args.corpus,
@@ -131,6 +136,10 @@ def _check_run_candidate(baseline: dict, args) -> str:
         argv += ["--embedding-api", api]
         if m.get("embedding_model"):
             argv += ["--embedding-model", str(m["embedding_model"])]
+    if m.get("max_inputs") is not None:
+        # replayed so a truncated-corpus baseline reproduces its own
+        # corpus_sha256 instead of a misleading "corpus mismatch"
+        argv += ["--max-inputs", str(m["max_inputs"])]
     if m.get("temperature") is not None:
         argv += ["--temperature", str(m["temperature"])]
     if m.get("max_tokens") is not None:
@@ -141,9 +150,14 @@ def _check_run_candidate(baseline: dict, args) -> str:
             argv.append(flag)
     if m.get("judge"):
         argv += ["--judge-model", str(m["judge_model"])]
-    rc = main(argv)
+    from .check import CheckError
+    try:
+        rc = main(argv)
+    except (Exception, SystemExit) as e:
+        # child failures (bad corpus, missing key/extra) are infra, not
+        # policy — never let them escape as exit 1 or argparse's 2
+        raise CheckError(f"--run analysis failed: {e}")
     if rc != 0:
-        from .check import CheckError
         raise CheckError(f"--run analysis failed with exit code {rc}")
     return os.path.splitext(out)[0] + ".json"
 
@@ -178,7 +192,10 @@ def _compare(ap, args) -> int:
                         argv.append(f"--{flag}")
                 try:
                     rc = main(argv)
-                except Exception as e:
+                except (Exception, SystemExit) as e:
+                    # SystemExit included: corpus/metric errors raise it,
+                    # and the partial-failure contract (keep completed
+                    # reports) must hold for those too
                     rc, err = 1, e
                 else:
                     err = None
@@ -407,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                  sparse_margin=spec.sparse_margin,
                  correction=args.correction, q_level=args.q,
                  probe_replicates=args.probe_replicates,
-                 do_judge=args.judge,
+                 do_judge=args.judge, max_inputs=args.max_inputs,
                  rescue=not args.no_rescue, verbose=not args.quiet,
                  concurrency=args.concurrency)
     if args.judge and args.provider != "anthropic":

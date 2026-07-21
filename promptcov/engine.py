@@ -40,6 +40,7 @@ class Config:
     q_level: float = 0.10              # FDR level for bh
     probe_replicates: int = 3
     do_judge: bool = False
+    max_inputs: int | None = None      # recorded so check --run can replay
     rescue: bool = True
     verbose: bool = True
     concurrency: int = 8
@@ -115,8 +116,11 @@ def corpus_sha256(inputs: list) -> str:
     whitespace in the source file can never change the identity. Trace
     rows contribute their canonical serialization."""
     from .trace import canonical_json
+    # NUL sentinel mirrors runner._key: a plain-string row equal to a
+    # trace's canonical JSON must not hash identically to the trace
     return sha256_text(canonical_json(
-        [x if isinstance(x, str) else x.canonical for x in inputs]))
+        [x if isinstance(x, str) else f"\x00trace\x00{x.canonical}"
+         for x in inputs]))
 
 
 def _log(cfg: Config, msg: str):
@@ -174,9 +178,11 @@ class Engine:
         t0 = time.time()
         doc = parse(prompt_text)
         # batch-resume identity: a manifest entry only resumes when it was
-        # submitted for this exact prompt + corpus
+        # submitted for this exact prompt + corpus + provider (model and
+        # sampling settings are embedded in the provider name)
         self.runner.fingerprint = {"prompt_sha256": sha256_text(prompt_text),
-                                   "corpus_sha256": corpus_sha256(inputs)}
+                                   "corpus_sha256": corpus_sha256(inputs),
+                                   "provider": self.p.name}
         res = Results(doc=doc, inputs=inputs)
         leaves = doc.leaves()
         _log(cfg, f"● segmented: {len(doc.sections)} sections, "
@@ -262,6 +268,7 @@ class Engine:
             "provider": self.p.name,
             "model": getattr(self.p, "model", "mock/aria-sim"),
             "inputs": len(inputs),
+            "max_inputs": cfg.max_inputs,
             "replicates": cfg.replicates,
             "negate": cfg.do_negate, "probes": cfg.do_probes,
             "probe_n": cfg.probe_n,
@@ -291,20 +298,19 @@ class Engine:
 
     def _apply_corrected_decision(self, d: st.TestResult, qv: float):
         """Re-decide a leaf deletion under the multiplicity-adjusted
-        deciding p. The channel gates mirror evaluate(): dense needs the
-        minimum-effect bar, sparse needs measured noise and >= 2 hits."""
+        deciding p — MONOTONE: correction only ever removes significance.
+        Mixing the deciding p (channel minimum) with the other channel's
+        auxiliary gate could manufacture verdicts evaluate() rejected
+        (e.g. a sparse near-miss p paired with the dense effect bar), so
+        a leaf evaluate() called insignificant stays insignificant, and a
+        significant leaf survives only if its corrected q clears the
+        threshold. evaluate()'s own channel gates already vetted the
+        winning mode."""
         cfg = self.cfg
         thresh = cfg.q_level if cfg.correction == "bh" else cfg.alpha
-        dense_ok = d.effect > cfg.min_effect
-        sparse_ok = bool(d.noise) and d.tail_hits >= 2
-        sig = qv < thresh and (dense_ok or sparse_ok)
-        d.significant = sig
-        if not sig:
+        if d.significant and qv >= thresh:
+            d.significant = False
             d.mode = ""
-        elif dense_ok and (d.p_value <= d.p_tail or not sparse_ok):
-            d.mode = "dense"
-        else:
-            d.mode = "sparse"
 
     def _leaf_cascade(self, doc: Doc, leaf: Segment, inputs: list[str],
                       res: Results, d: st.TestResult):

@@ -38,8 +38,13 @@ class BatchPending(RuntimeError):
 
 
 def _key(provider_name: str, system: str, user, run_tag: str) -> str:
+    # Trace rows carry a NUL sentinel so a plain-string row whose text
+    # equals a trace's canonical JSON can never share a cache entry with
+    # it (raw NUL cannot appear in json.dumps output); plain strings keep
+    # their v0.1 keys byte-identical.
+    u = user if isinstance(user, str) else f"\x00trace\x00{user}"
     return hashlib.sha256(
-        f"{provider_name}\x00{system}\x00{user}\x00{run_tag}".encode()
+        f"{provider_name}\x00{system}\x00{u}\x00{run_tag}".encode()
     ).hexdigest()
 
 
@@ -214,16 +219,21 @@ class Runner:
             fh.write(json.dumps(rec) + "\n")
 
     def _run_batch_phase(self, jobs, keys):
-        # 1 — resume: drain any batch this run-shape already has in flight
+        # 1 — resume: drain any batch this run-shape already has in flight.
+        # Entries for a DIFFERENT run shape (other prompt/corpus/provider
+        # sharing this cache dir) are skipped, not tombstoned — another
+        # run may still be waiting on them. Only results-expired entries
+        # are discarded.
         for bid, rec in self._manifest_open().items():
-            stale = (rec.get("fingerprint") != self.fingerprint or
-                     time.time() - rec.get("created", 0)
-                     > _RESULT_RETENTION_S)
-            if stale:
+            if time.time() - rec.get("created", 0) > _RESULT_RETENTION_S:
                 self._manifest_append({"batch_id": bid, "discarded": True})
-                self._note(f"● batch {bid}: manifest entry is stale "
-                           f"(prompt/corpus changed or results expired) — "
-                           f"discarded, affected inputs will resubmit")
+                self._note(f"● batch {bid}: results past the retention "
+                           f"window — discarded, affected inputs will "
+                           f"resubmit")
+                continue
+            if rec.get("fingerprint") != self.fingerprint:
+                self._note(f"● batch {bid}: belongs to a different run "
+                           f"shape — skipped")
                 continue
             self._note(f"● batch {bid}: resuming from manifest")
             self._drain(bid, self._unpack_requests(rec))
@@ -269,6 +279,10 @@ class Runner:
             status = info.get("processing_status")
             if status == "ended":
                 break
+            if self.no_wait:
+                # --no-wait must never block on someone's 24h window —
+                # including the resume path
+                raise BatchPending([bid])
             counts = info.get("request_counts") or {}
             self._note(f"● batch {bid}: {status} "
                        f"({', '.join(f'{k}={v}' for k, v in counts.items())}"

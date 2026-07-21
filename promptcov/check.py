@@ -113,6 +113,7 @@ def compare_reports(baseline: dict, candidate: dict, strict: bool = False,
     cand_by_text = _by_text(leaves(candidate))
 
     regressions, unknown, resolution_changes = [], [], []
+    neutralized, deleted_kept = [], []
     for text, occurrences in base_by_text.items():
         verdicts = [o.get("verdict") for o in occurrences]
         if text not in cand_by_text:
@@ -126,12 +127,26 @@ def compare_reports(baseline: dict, candidate: dict, strict: bool = False,
                 unknown.append({"id": occurrences[0]["id"], "text": text,
                                 "side": "baseline",
                                 "verdict": verdicts[0]})
+            else:
+                # REDUNDANT/UNEXERCISED rules were KEPT in the pruned
+                # prompt for a reason — deleting one deserves eyes even
+                # though it never gates
+                for o in occurrences:
+                    if o.get("verdict") in (st.REDUNDANT, st.UNEXERCISED):
+                        deleted_kept.append({"id": o["id"], "text": text,
+                                             "verdict": o.get("verdict")})
         else:
             cand_vs = [o.get("verdict") for o in cand_by_text[text]]
             b, c = verdicts[0], cand_vs[0]
             if (b in UNKNOWN_VERDICTS) != (c in UNKNOWN_VERDICTS):
                 resolution_changes.append(
                     {"text": text, "baseline": b, "candidate": c})
+            elif (b == st.LOAD_BEARING and c == st.NO_OBSERVED_EFFECT):
+                # in-place neutralization: identical text, verdict flipped
+                # to dead — a surrounding edit (or flakiness) killed the
+                # rule without touching it. Warn; fail under --strict.
+                neutralized.append({"text": text, "baseline": b,
+                                    "candidate": c})
 
     new_dead, new_unmatched = [], []
     for text, occurrences in cand_by_text.items():
@@ -147,16 +162,18 @@ def compare_reports(baseline: dict, candidate: dict, strict: bool = False,
 
     if regressions:
         code = EXIT_POLICY
-    elif new_dead and strict:
+    elif strict and (new_dead or neutralized):
         code = EXIT_POLICY
     else:
         code = EXIT_PASS
     return code, {
         "result": "fail" if code else "pass",
         "regressions": regressions,
+        "neutralized": neutralized,
         "new_dead": new_dead,
         "new_unmatched": new_unmatched,
         "resolution_changes": resolution_changes,
+        "deleted_kept": deleted_kept,
         "unknown": unknown,
         "strict": strict,
     }
@@ -173,6 +190,12 @@ def render_outcome(outcome: dict, out=sys.stderr):
             eff = (f"  eff {r['baseline_effect']:+.3f}"
                    if r.get("baseline_effect") is not None else "")
             p(f"  ▸ {r['id']}{eff}  “{r['text'].strip()[:80]}”")
+    for nz in outcome["neutralized"]:
+        tag = "FAIL (--strict)" if outcome["strict"] else "warning"
+        p(f"● {tag}: LOAD_BEARING rule neutralized in place — text "
+          f"unchanged but verdict fell to NO_OBSERVED_EFFECT  "
+          f"“{nz['text'].strip()[:80]}” (a surrounding edit or run "
+          f"flakiness; regenerate the baseline if intentional)")
     for nd in outcome["new_dead"]:
         tag = "FAIL (--strict)" if outcome["strict"] else "warning"
         p(f"● {tag}: new rule lands NO_OBSERVED_EFFECT  "
@@ -180,6 +203,10 @@ def render_outcome(outcome: dict, out=sys.stderr):
     for nu in outcome["new_unmatched"]:
         p(f"  · unmatched new text ({nu['verdict']}): "
           f"“{nu['text'].strip()[:80]}” — unknown, not gated")
+    for dk in outcome["deleted_kept"]:
+        p(f"  · deleted rule the baseline kept as {dk['verdict']} "
+          f"(live per negation/probes): “{dk['text'].strip()[:60]}” — "
+          f"not gated, but review intentionality")
     for u in outcome["unknown"]:
         p(f"  · deleted rule with unknown baseline verdict "
           f"({u['verdict']}): “{u['text'].strip()[:60]}” — not gated")

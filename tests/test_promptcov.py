@@ -642,24 +642,79 @@ def test_batch_resume_from_manifest(monkeypatch):
         assert all(o for o in outs[0])
 
 
-def test_batch_discards_stale_manifest(monkeypatch):
+def _manifest_entry(runner, bid, fingerprint, created):
+    runner._manifest_append({
+        "batch_id": bid, "tag": "t0", "fingerprint": fingerprint,
+        "created": created,
+        **runner._pack_requests([{"custom_id": "x", "system": "s",
+                                  "user": "u", "run_tag": "t0"}])})
+
+
+def test_batch_discards_expired_manifest_by_age_alone(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import Runner
+    fp = {"prompt_sha256": "SAME", "corpus_sha256": "SAME"}
+    with tempfile.TemporaryDirectory() as td:
+        store = {}
+        r0 = Runner(_FakeBatchProvider(store), cache_dir=td)
+        _manifest_entry(r0, "batch_old", fp, created=1.0)  # ancient
+        fake = _FakeBatchProvider(store)
+        r = Runner(fake, cache_dir=td)
+        r.fingerprint = fp           # SAME fingerprint: age alone discards
+        r.batch_group([("sys", ["u1"], "t0")])
+        assert fake.submits == 1
+        assert "batch_old" not in r._manifest_open()
+
+
+def test_batch_skips_foreign_fingerprint_without_tombstoning(monkeypatch):
+    # another run shape's live batch (fresh, different fingerprint) must
+    # be left alone — skipping, not discarding, so the other run can
+    # still resume it
     import promptcov.runner as runner_mod
     monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
     from promptcov.runner import Runner
     with tempfile.TemporaryDirectory() as td:
         store = {}
-        killed_fp = {"prompt_sha256": "OLD", "corpus_sha256": "OLD"}
         r0 = Runner(_FakeBatchProvider(store), cache_dir=td)
-        r0._manifest_append({"batch_id": "batch_stale", "tag": "t0",
-                             "fingerprint": killed_fp, "created": 1.0,
-                             "requests": [{"custom_id": "x", "system": "s",
-                                           "user": "u", "run_tag": "t0"}]})
+        _manifest_entry(r0, "batch_foreign",
+                        {"prompt_sha256": "OTHER", "corpus_sha256": "X"},
+                        created=runner_mod.time.time())
         fake = _FakeBatchProvider(store)
         r = Runner(fake, cache_dir=td)
-        r.fingerprint = {"prompt_sha256": "NEW", "corpus_sha256": "NEW"}
+        r.fingerprint = {"prompt_sha256": "MINE", "corpus_sha256": "Y"}
         r.batch_group([("sys", ["u1"], "t0")])
-        assert fake.submits == 1     # fresh submission, stale one discarded
-        assert "batch_stale" not in r._manifest_open()
+        assert fake.submits == 1                       # own work proceeds
+        assert "batch_foreign" in r._manifest_open()   # still open
+
+
+def test_batch_no_wait_never_blocks_on_resume(monkeypatch):
+    import promptcov.runner as runner_mod
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
+    from promptcov.runner import BatchPending, Runner
+
+    class _StuckInProgress(_FakeBatchProvider):
+        def poll_batch(self, bid):
+            return {"processing_status": "in_progress"}
+
+    fp = {"prompt_sha256": "A", "corpus_sha256": "B"}
+    with tempfile.TemporaryDirectory() as td:
+        store = {}
+        p1 = _FakeBatchProvider(store)
+        r1 = Runner(p1, cache_dir=td)
+        r1.fingerprint = fp
+        r1.no_wait = True
+        with pytest.raises(BatchPending):
+            r1.batch_group([("sys", ["u1"], "t0")])
+        # rerun with --no-wait while the batch is still in flight: exits
+        # via BatchPending instead of polling for up to 24h
+        p2 = _StuckInProgress(store)
+        r2 = Runner(p2, cache_dir=td)
+        r2.fingerprint = fp
+        r2.no_wait = True
+        with pytest.raises(BatchPending):
+            r2.batch_group([("sys", ["u1"], "t0")])
+        assert p2.submits == 0
 
 
 def test_batch_per_item_errors(monkeypatch):
@@ -714,6 +769,171 @@ def test_batch_no_wait_submits_and_resumes(monkeypatch):
         r2 = Runner(p2, cache_dir=td)
         outs = r2.batch_group([("sys", ["u1"], "t0")])
         assert p2.submits == 0 and outs[0][0]
+
+
+class _Resp:
+    def __init__(self, status=200, json_data=None, text=""):
+        self.status_code = status
+        self._json = json_data
+        self.text = text or (json.dumps(json_data) if json_data else "")
+
+    def json(self):
+        return self._json
+
+
+class _ScriptedHTTP:
+    """Stub httpx-like client: scripted responses (or exceptions), calls
+    recorded as (method, url, body)."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, json=None):
+        self.calls.append((method, url, json))
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def _bare_anthropic(client):
+    from promptcov.providers import AnthropicProvider
+    p = AnthropicProvider.__new__(AnthropicProvider)
+    p.model, p.max_tokens, p.temperature = "test-model", 64, 1.0
+    p.batch_enabled = True
+    p._client = client
+    return p
+
+
+def test_retry_request_retries_transport_and_status(monkeypatch):
+    import promptcov.providers as prov
+    monkeypatch.setattr(prov.time, "sleep", lambda s: None)
+
+    class _Boom(Exception):
+        pass
+
+    ok = _Resp(200, {"fine": True})
+    # transport errors retried via the injectable exception set
+    c = _ScriptedHTTP([_Boom(), _Boom(), ok])
+    r = prov.retry_request(c, "GET", "/x", retryable_exceptions=(_Boom,))
+    assert r.json() == {"fine": True} and len(c.calls) == 3
+    # transient statuses retried
+    c2 = _ScriptedHTTP([_Resp(429), _Resp(529), ok])
+    assert prov.retry_request(c2, "GET", "/x").json() == {"fine": True}
+    # hard 4xx fails fast
+    c3 = _ScriptedHTTP([_Resp(400, text="bad request body")])
+    with pytest.raises(RuntimeError, match="API 400"):
+        prov.retry_request(c3, "GET", "/x")
+    # exhaustion names the last transport error
+    c4 = _ScriptedHTTP([_Boom("net down")] * 6)
+    with pytest.raises(RuntimeError, match="net down"):
+        prov.retry_request(c4, "GET", "/x", retryable_exceptions=(_Boom,))
+
+
+def test_anthropic_submit_batch_body_shape():
+    from promptcov.trace import Trace
+    client = _ScriptedHTTP([_Resp(200, {"id": "batch_wire"})])
+    p = _bare_anthropic(client)
+    trace = Trace.from_messages([{"role": "user", "content": "q1"},
+                                 {"role": "assistant", "content": "a1"},
+                                 {"role": "user", "content": "q2"}])
+    bid = p.submit_batch([
+        {"custom_id": "k1", "system": "SYS", "user": "hello",
+         "run_tag": "t"},
+        {"custom_id": "k2", "system": "SYS", "user": trace,
+         "run_tag": "t"},
+    ])
+    assert bid == "batch_wire"
+    method, url, body = client.calls[0]
+    assert (method, url) == ("POST", "/v1/messages/batches")
+    r1, r2 = body["requests"]
+    assert r1["custom_id"] == "k1"
+    sysblock = r1["params"]["system"][0]
+    assert sysblock["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert r1["params"]["messages"] == [{"role": "user",
+                                         "content": "hello"}]
+    assert r2["params"]["messages"] == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"}]
+
+
+def test_anthropic_batch_results_classification():
+    results_jsonl = "\n".join([
+        json.dumps({"custom_id": "ok", "result": {
+            "type": "succeeded", "message": {"content": [
+                {"type": "text", "text": "hello "},
+                {"type": "thinking", "thinking": "..."},
+                {"type": "text", "text": "world"}]}}}),
+        json.dumps({"custom_id": "bad", "result": {
+            "type": "errored",
+            "error": {"error": {"type": "invalid_request_error"}}}}),
+        json.dumps({"custom_id": "flaky", "result": {
+            "type": "errored", "error": {"error": {"type": "api_error"}}}}),
+        json.dumps({"custom_id": "late", "result": {"type": "expired"}}),
+    ])
+    client = _ScriptedHTTP([
+        _Resp(200, {"processing_status": "ended",
+                    "results_url": "https://api/results/x"}),
+        _Resp(200, None, text=results_jsonl),
+    ])
+    p = _bare_anthropic(client)
+    triples = list(p.batch_results("batch_wire"))
+    assert ("ok", "succeeded", "hello world") in triples
+    kinds = {cid: kind for cid, kind, _ in triples}
+    assert kinds == {"ok": "succeeded", "bad": "errored_invalid",
+                     "flaky": "retryable", "late": "retryable"}
+
+
+def test_anthropic_complete_omits_empty_system():
+    client = _ScriptedHTTP([
+        _Resp(200, {"content": [{"type": "text", "text": "judged"}]})])
+    p = _bare_anthropic(client)
+    assert p.complete("", "judge prompt") == "judged"
+    _, _, body = client.calls[0]
+    assert "system" not in body   # the API rejects empty text blocks
+
+
+def test_trace_key_never_collides_with_equal_plain_string():
+    from promptcov.engine import corpus_sha256
+    from promptcov.runner import _key
+    from promptcov.trace import Trace
+    t = Trace.from_messages([{"role": "user", "content": "q"}])
+    impostor = t.canonical                     # plain string, same bytes
+    assert _key("mock", "s", t, "r0") != _key("mock", "s", impostor, "r0")
+    assert corpus_sha256([t]) != corpus_sha256([impostor])
+
+
+def test_corrected_decision_is_monotone():
+    # a leaf evaluate() rejected must never be flipped significant by the
+    # correction stage, even when its deciding q clears the threshold
+    # (mixed-channel scenario: sparse near-miss p + dense effect bar)
+    with tempfile.TemporaryDirectory() as td:
+        eng = Engine(MockProvider(), Config(verbose=False), cache_dir=td)
+    mixed = st.TestResult(scores=[0.1] * 10, noise=[0.05] * 20,
+                          p_value=0.2, p_tail=0.02, tail_hits=1,
+                          effect=0.05, significant=False, mode="")
+    eng._apply_corrected_decision(mixed, qv=0.04)
+    assert not mixed.significant and mixed.mode == ""
+    # and a significant leaf keeps its evaluate()-vetted mode on survival
+    dense = st.TestResult(scores=[0.3] * 10, noise=[0.05] * 20,
+                          p_value=0.001, p_tail=0.9, tail_hits=0,
+                          effect=0.25, significant=True, mode="dense")
+    eng._apply_corrected_decision(dense, qv=0.02)
+    assert dense.significant and dense.mode == "dense"
+
+
+def test_estimate_batch_split_arithmetic():
+    from promptcov.engine import (Config, estimate_batch_split,
+                                  estimate_calls)
+    doc = parse(ARIA)
+    cfg = Config(do_negate=True, do_probes=True, do_judge=True)
+    batchable, sync_only = estimate_batch_split(doc, 28, cfg)
+    s, l = len(doc.sections), len(doc.leaves())
+    assert batchable == cfg.replicates * 28 + s * 28 + l * 28 + 28
+    _, ceil = estimate_calls(doc, 28, cfg)
+    assert batchable + sync_only == ceil
 
 
 def test_dry_run_batch_split(capsys):
@@ -916,6 +1136,86 @@ def test_check_unknown_and_duplicates():
     assert code == EXIT_PASS and out["new_unmatched"]
 
 
+def test_check_neutralized_and_deleted_kept_buckets():
+    from promptcov.check import EXIT_PASS, EXIT_POLICY, compare_reports
+
+    def stub(segs):
+        return {"meta": {"schema_version": 2, "prompt_sha256": "p" * 64,
+                         "corpus_sha256": "c" * 64, "metric": "lexical",
+                         "model": "m", "temperature": 1.0,
+                         "max_tokens": 64, "replicates": 2,
+                         "negate": True, "probes": True, "probe_n": 4,
+                         "probe_replicates": 3, "alpha": 0.05,
+                         "min_effect": 0.02, "correction": "bh", "q": 0.1,
+                         "exhaustive": False, "judge": False,
+                         "judge_model": None},
+                "segments": segs}
+
+    leaf = lambda i, text, v: {"id": f"S1.L{i}", "kind": "leaf",  # noqa: E731
+                               "text": text, "verdict": v}
+    # in-place neutralization: same text, LOAD_BEARING -> dead
+    base = stub([leaf(1, "rule A\n", st.LOAD_BEARING)])
+    cand = stub([leaf(1, "rule A\n", st.NO_OBSERVED_EFFECT)])
+    code, out = compare_reports(base, cand)
+    assert code == EXIT_PASS and out["neutralized"]
+    code, out = compare_reports(base, cand, strict=True)
+    assert code == EXIT_POLICY
+    # deleting a kept REDUNDANT/UNEXERCISED rule is surfaced, never gated
+    base = stub([leaf(1, "spare rule\n", st.REDUNDANT),
+                 leaf(2, "dormant rule\n", st.UNEXERCISED)])
+    cand = stub([])
+    code, out = compare_reports(base, cand, strict=True)
+    assert code == EXIT_PASS
+    assert {d["verdict"] for d in out["deleted_kept"]} == {
+        st.REDUNDANT, st.UNEXERCISED}
+
+
+def test_check_run_maps_child_failure_to_exit_3(tmp_path, monkeypatch):
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    out = str(tmp_path / "b.html")
+    assert main(["run", "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--quiet", "--out", out,
+                 "--pruned-out", str(tmp_path / "p.md"),
+                 "--cache-dir", str(tmp_path / "cache")]) == 0
+    # child analysis raises SystemExit (truncated corpus row): infra, 3
+    bad_corpus = tmp_path / "bad.jsonl"
+    bad_corpus.write_text('{"input": "x"\n')
+    rc = main(["check", str(tmp_path / "b.json"), "--run",
+               "--prompt", prompt, "--corpus", str(bad_corpus),
+               "--cache-dir", str(tmp_path / "cache")])
+    assert rc == 3
+
+
+def test_check_run_cleans_tempdir_and_replays_max_inputs(tmp_path,
+                                                        monkeypatch):
+    import promptcov.cli as cli_mod
+    from promptcov.cli import main
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    cache = str(tmp_path / "cache")
+    out = str(tmp_path / "trunc.html")
+    # baseline over a TRUNCATED corpus
+    assert main(["run", "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--quiet", "--max-inputs", "8",
+                 "--out", out, "--pruned-out", str(tmp_path / "p.md"),
+                 "--cache-dir", cache]) == 0
+    meta = json.load(open(str(tmp_path / "trunc.json")))["meta"]
+    assert meta["max_inputs"] == 8
+    made = []
+    import tempfile as _tf
+    real_mkdtemp = _tf.mkdtemp
+    monkeypatch.setattr(_tf, "mkdtemp",
+                        lambda **kw: made.append(real_mkdtemp(**kw))
+                        or made[-1])
+    # --run replays --max-inputs so the corpus hash matches, and cleans up
+    assert main(["check", str(tmp_path / "trunc.json"), "--run",
+                 "--prompt", prompt, "--corpus", corpus,
+                 "--cache-dir", cache]) == 0
+    assert made and not os.path.exists(made[0])
+
+
 def test_check_cli_run_parity(tmp_path, capsys):
     from promptcov.cli import main
     prompt = os.path.join(EXAMPLES, "aria_prompt.md")
@@ -1004,8 +1304,10 @@ def test_compare_cli_orchestration_offline(tmp_path):
     assert "NOT" in html and "noise floor" in html
 
 
+@pytest.mark.parametrize("exc", [RuntimeError("provider exploded"),
+                                 SystemExit("corpus rejected")])
 def test_compare_cli_partial_failure_keeps_first_report(tmp_path,
-                                                        monkeypatch):
+                                                        monkeypatch, exc):
     import promptcov.cli as cli_mod
     from promptcov.cli import main
     prompt = os.path.join(EXAMPLES, "aria_prompt.md")
@@ -1014,7 +1316,7 @@ def test_compare_cli_partial_failure_keeps_first_report(tmp_path,
 
     def boom(name, model, *a, **kw):
         if model == "mock/boom":
-            raise RuntimeError("provider exploded")
+            raise exc
         return real_provider(name, model, *a, **kw)
 
     monkeypatch.setattr(cli_mod, "_provider", boom)
@@ -1026,6 +1328,69 @@ def test_compare_cli_partial_failure_keeps_first_report(tmp_path,
     assert rc == 3
     assert os.path.exists(str(tmp_path / "cmp-mock_sim-a.json"))
     assert not os.path.exists(out)
+
+
+# ------------------------------ real judge -------------------------------
+
+class _ScriptedJudgeProvider:
+    def __init__(self, outputs, name="scripted-judge:t0"):
+        self.name = name
+        self.model = "scripted-judge"
+        self.outputs = list(outputs)
+        self.prompts = []
+
+    def complete(self, system, user, run_tag=""):
+        self.prompts.append(user)
+        out = self.outputs.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
+def _real_judge(outputs, td):
+    from promptcov.judge import Judge
+    return Judge(_ScriptedJudgeProvider(outputs), cache_dir=td)
+
+
+def test_real_judge_decisions_and_parse_paths(capsys):
+    with tempfile.TemporaryDirectory() as td:
+        # downgrade: significant + stylistic mean
+        j = _real_judge(["It differs slightly.\nSCORE: 1"], td)
+        r = j.score_pairs("S1.L1", ["q"], ["v"], [["b"]], [0.5],
+                          significant=True)
+        assert r.verdict_effect == "downgraded" and r.mean_score == 1.0
+    with tempfile.TemporaryDirectory() as td:
+        # upgrade: near-miss + substantive mean
+        j = _real_judge(["Materially different.\nSCORE: 3"], td)
+        r = j.score_pairs("S1.L1", ["q"], ["v"], [["b"]], [0.5],
+                          significant=False)
+        assert r.verdict_effect == "upgraded"
+    with tempfile.TemporaryDirectory() as td:
+        # SCORE line missing: pair contributes nothing -> unavailable
+        j = _real_judge(["no score anywhere in this reply"], td)
+        r = j.score_pairs("S1.L1", ["q"], ["v"], [["b"]], [0.5],
+                          significant=True)
+        assert r.verdict_effect == "unavailable" and r.n_pairs == 0
+    with tempfile.TemporaryDirectory() as td:
+        # systemic failure: unavailable AND an operator-visible warning
+        j = _real_judge([RuntimeError("API 404: model not found")], td)
+        r = j.score_pairs("S1.L1", ["q"], ["v"], [["b"]], [0.5],
+                          significant=True)
+        assert r.verdict_effect == "unavailable"
+        assert "model not found" in capsys.readouterr().err
+
+
+def test_real_judge_sees_trace_final_turn():
+    from promptcov.trace import Trace
+    trace = Trace.from_messages([{"role": "user", "content": "earlier"},
+                                 {"role": "assistant", "content": "mid"},
+                                 {"role": "user", "content": "FINAL ASK"}])
+    with tempfile.TemporaryDirectory() as td:
+        j = _real_judge(["fine\nSCORE: 0"], td)
+        j.score_pairs("S1.L1", [trace], ["v"], [["b"]], [0.5])
+        prompt = j.runner.provider.prompts[0]
+        assert "FINAL ASK" in prompt
+        assert '"role"' not in prompt   # canonical JSON never leaks in
 
 
 class _EitherOrProvider:

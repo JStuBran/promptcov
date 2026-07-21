@@ -21,13 +21,29 @@ import re
 import time
 
 
-def retry_request(client, method: str, url: str, body: dict | None = None):
+def retry_request(client, method: str, url: str, body: dict | None = None,
+                  retryable_exceptions: tuple | None = None):
     """Shared HTTP retry ladder: 6 attempts, exponential backoff capped at
-    30s, retrying the transient statuses. Used by every raw-HTTP surface
-    (Messages, Batches, embeddings) so backoff policy can't drift."""
+    30s, retrying transient statuses AND transport-level failures
+    (connection drops, read timeouts) — a network blip must not kill a
+    multi-hour batch run. Used by every raw-HTTP surface (Messages,
+    Batches, embeddings) so backoff policy can't drift."""
+    if retryable_exceptions is None:
+        try:
+            import httpx  # lazy: mock mode stays dependency-free
+            retryable_exceptions = (httpx.TransportError,)
+        except ImportError:   # stub clients in tests
+            retryable_exceptions = ()
     delay = 2.0
+    last_exc: Exception | None = None
     for _ in range(6):
-        r = client.request(method, url, json=body)
+        try:
+            r = client.request(method, url, json=body)
+        except retryable_exceptions as e:
+            last_exc = e
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
         if r.status_code == 200:
             return r
         if r.status_code in (429, 500, 502, 503, 529):
@@ -35,7 +51,8 @@ def retry_request(client, method: str, url: str, body: dict | None = None):
             delay = min(delay * 2, 30)
             continue
         raise RuntimeError(f"API {r.status_code}: {r.text[:300]}")
-    raise RuntimeError("API retries exhausted")
+    suffix = f" (last transport error: {last_exc})" if last_exc else ""
+    raise RuntimeError(f"API retries exhausted{suffix}")
 
 
 # ============================== Anthropic ================================
