@@ -290,6 +290,7 @@ class Runner:
             time.sleep(min(delay, 60.0))
             delay *= 1.7
         unresolved: list[dict] = []
+        invalid: list[dict] = []
         for cid, kind, payload in self.provider.batch_results(bid):
             r = req_by_id.pop(cid, None)
             if r is None:
@@ -297,13 +298,19 @@ class Runner:
             if kind == "succeeded":
                 self._store(cid, payload)
             elif kind == "errored_invalid":
-                raise RuntimeError(
-                    f"batch item rejected as invalid_request — not "
-                    f"retryable. Input: {str(r['user'])[:120]!r}")
+                invalid.append(r)
             else:  # expired / canceled / server-errored
                 unresolved.append(r)
         unresolved += list(req_by_id.values())   # absent from the results
+        # the batch HAS ended and its succeeded siblings are merged —
+        # tombstone it BEFORE failing on invalid items, or the open entry
+        # re-drains and re-raises the same error on every resume forever
         self._manifest_append({"batch_id": bid, "done": True})
+        if invalid:
+            raise RuntimeError(
+                f"batch {bid}: {len(invalid)} item(s) rejected as "
+                f"invalid_request — not retryable. First input: "
+                f"{str(invalid[0]['user'])[:120]!r}")
         if unresolved:
             self._note(f"● batch {bid}: {len(unresolved)} items to resubmit")
         return unresolved
