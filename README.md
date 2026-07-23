@@ -192,4 +192,4 @@ Run it. Watch the funeral. Watch the cheese rule get its justice.
 
 ---
 
-*promptcov v0.2.0 — no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
+*promptcov v0.2.0 — MIT licensed, no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
