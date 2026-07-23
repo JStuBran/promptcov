@@ -64,7 +64,13 @@ class AnthropicProvider:
     def __init__(self, model: str = "claude-sonnet-4-6",
                  max_tokens: int = 1024, temperature: float = 1.0,
                  batch: bool = False):
-        import httpx  # lazy: mock mode stays dependency-free
+        try:
+            import httpx  # lazy: mock mode stays dependency-free
+        except ImportError:
+            raise SystemExit(
+                "--provider anthropic needs the optional extra:\n"
+                "  pip install 'promptcov[anthropic]'\n"
+                "(or with uv: `uv run --extra anthropic promptcov ...`)")
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise RuntimeError(
@@ -101,7 +107,9 @@ class AnthropicProvider:
             "temperature": self.temperature,
             "messages": self._messages(user),
         }
-        if system:  # the API rejects empty text blocks (judge calls pass "")
+        # the API rejects empty text blocks (judge calls pass "", and a
+        # fully-pruned candidate can rebuild to pure whitespace)
+        if system.strip():
             body["system"] = [{"type": "text", "text": system,
                                "cache_control": {"type": "ephemeral"}}]
         return self._text(self._post(body).get("content", []))
@@ -120,18 +128,25 @@ class AnthropicProvider:
         return "".join(b.get("text", "") for b in content
                        if b.get("type") == "text")
 
+    def _batch_params(self, system: str, user) -> dict:
+        """Per-item Messages params. The system field is omitted when
+        empty/whitespace — the API rejects empty text blocks, and a
+        fully-pruned candidate prompt is a legitimate thing to verify
+        (found live: an all-dead prompt crashed the verification batch)."""
+        params = {"model": self.model, "max_tokens": self.max_tokens,
+                  "temperature": self.temperature,
+                  "messages": self._messages(user)}
+        if system.strip():
+            params["system"] = [{"type": "text", "text": system,
+                                 "cache_control": {"type": "ephemeral",
+                                                   "ttl": "1h"}}]
+        return params
+
     def submit_batch(self, reqs: list[dict]) -> str:
-        body = {"requests": [
-            {"custom_id": r["custom_id"],
-             "params": {
-                 "model": self.model,
-                 "max_tokens": self.max_tokens,
-                 "temperature": self.temperature,
-                 "system": [{"type": "text", "text": r["system"],
-                             "cache_control": {"type": "ephemeral",
-                                               "ttl": "1h"}}],
-                 "messages": self._messages(r["user"]),
-             }} for r in reqs]}
+        body = {"requests": [{"custom_id": r["custom_id"],
+                              "params": self._batch_params(r["system"],
+                                                           r["user"])}
+                             for r in reqs]}
         return self._request("POST", "/v1/messages/batches", body).json()["id"]
 
     def poll_batch(self, batch_id: str) -> dict:

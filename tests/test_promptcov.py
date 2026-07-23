@@ -843,11 +843,16 @@ def test_anthropic_submit_batch_body_shape():
          "run_tag": "t"},
         {"custom_id": "k2", "system": "SYS", "user": trace,
          "run_tag": "t"},
+        {"custom_id": "k3", "system": "\n\n", "user": "hello",
+         "run_tag": "t"},
     ])
     assert bid == "batch_wire"
     method, url, body = client.calls[0]
     assert (method, url) == ("POST", "/v1/messages/batches")
-    r1, r2 = body["requests"]
+    r1, r2, r3 = body["requests"]
+    # a fully-pruned (empty/whitespace) candidate prompt omits the system
+    # field — the API rejects empty text blocks (found live)
+    assert "system" not in r3["params"]
     assert r1["custom_id"] == "k1"
     sysblock = r1["params"]["system"][0]
     assert sysblock["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
