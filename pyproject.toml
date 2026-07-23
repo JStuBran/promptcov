@@ -2,9 +2,17 @@
 name = "promptcov"
 version = "0.2.0"
 description = "Coverage analysis for system prompts: which rules are load-bearing, which are decorative fossils"
+readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
+keywords = ["llm", "prompts", "prompt-engineering", "testing", "coverage",
+            "ablation", "anthropic", "claude"]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/JStuBran/promptcov"
+Repository = "https://github.com/JStuBran/promptcov"
+Issues = "https://github.com/JStuBran/promptcov/issues"
 
 [project.optional-dependencies]
 anthropic = ["httpx>=0.25"]
