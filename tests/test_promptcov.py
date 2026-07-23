@@ -409,7 +409,9 @@ def test_embedding_cache_reuses_vectors():
         assert m2.embeds == 0
 
 
-def test_local_embedding_metric_missing_extra():
+def test_local_embedding_metric_missing_extra(monkeypatch):
+    # simulate the extra being absent even when the venv has model2vec
+    monkeypatch.setitem(sys.modules, "model2vec", None)
     from promptcov.metrics import LocalEmbeddingMetric
     with pytest.raises(SystemExit, match=r"promptcov\[embeddings\]"):
         LocalEmbeddingMetric()
@@ -744,9 +746,15 @@ def test_batch_per_item_errors(monkeypatch):
         outs = r.batch_group([("sys", ["ok", "flaky"], "t0")])
         assert p.submits == 2 and len(outs[0]) == 2   # one bounded resubmit
     with tempfile.TemporaryDirectory() as td:
-        r = Runner(_InvalidItem(), cache_dir=td)
+        store = {}
+        r = Runner(_InvalidItem(store), cache_dir=td)
         with pytest.raises(RuntimeError, match="invalid_request"):
             r.batch_group([("sys", ["ok", "bad"], "t0")])
+        # the failed batch is tombstoned (drained succeeded siblings kept),
+        # so a resume never re-drains and re-raises the same poison batch
+        from promptcov.runner import _key
+        assert not r._manifest_open()
+        assert r._cache.get(_key("mock", "sys", "ok", "t0")) is not None
     with tempfile.TemporaryDirectory() as td:
         r = Runner(_AlwaysExpires(), cache_dir=td)
         with pytest.raises(RuntimeError, match="unresolved"):
@@ -843,11 +851,16 @@ def test_anthropic_submit_batch_body_shape():
          "run_tag": "t"},
         {"custom_id": "k2", "system": "SYS", "user": trace,
          "run_tag": "t"},
+        {"custom_id": "k3", "system": "\n\n", "user": "hello",
+         "run_tag": "t"},
     ])
     assert bid == "batch_wire"
     method, url, body = client.calls[0]
     assert (method, url) == ("POST", "/v1/messages/batches")
-    r1, r2 = body["requests"]
+    r1, r2, r3 = body["requests"]
+    # a fully-pruned (empty/whitespace) candidate prompt omits the system
+    # field — the API rejects empty text blocks (found live)
+    assert "system" not in r3["params"]
     assert r1["custom_id"] == "k1"
     sysblock = r1["params"]["system"][0]
     assert sysblock["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
