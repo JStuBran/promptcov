@@ -26,7 +26,7 @@ The result isn't an opinion. It's a regression table you can put in a PR.
 ## Quickstart
 
 ```bash
-pip install -e .
+pip install promptcov
 promptcov demo          # offline, no API key — runs the packaged haunted-prompt demo
 open aria_report.html
 ```
@@ -36,7 +36,7 @@ The demo analyzes a fictional (but painfully familiar) customer-support prompt a
 ## Real usage
 
 ```bash
-pip install -e '.[anthropic]'
+pip install 'promptcov[anthropic]'
 export ANTHROPIC_API_KEY=sk-ant-…
 
 promptcov run \
@@ -126,7 +126,7 @@ If step 1 shows one giant leaf, add blank lines between rules and `##` headers b
 
 3. **Two significance paths per segment.**
    - *Dense:* permutation test (3,000 permutations) on mean divergence, plus a minimum-effect gate — statistically detectable but trivially small shifts don't count.
-   - *Sparse:* a rule that fires hard on 3 of 200 inputs barely moves the median, so median-based metrics call it dead. Instead: count inputs exceeding the noise p99 and test that count against a Binomial(n, 0.01) tail. This is how the demo's cheese rule — mocked for months, load-bearing all along — gets its justice.
+   - *Sparse:* a rule that fires hard on 3 of 200 inputs barely moves the median, so median-based metrics call it dead. Instead: count inputs exceeding the noise p99 and test that count against a Binomial(n, 0.01) tail — firing hard on a handful of inputs is a signal, not an outlier.
 
 4. **Negation** (`--negate`). If deleting a rule is inert but *inverting* it fires, the rule is `REDUNDANT`: its content is enforced by something else in the prompt (or by the model's defaults). promptcov keeps redundant rules in the pruned prompt — they're your safety margin, not your dead weight.
 
@@ -167,12 +167,11 @@ Read this before you paste the report into a PR.
 
 ## Roadmap
 
-Shipped in 0.2.0: embedding + LLM-judge divergence, the Batches backend, `promptcov check`, teacher-forced multi-turn replay, cross-model `compare`, and Benjamini-Hochberg correction. Still ahead:
+Shipped in 0.2.0 (on [PyPI](https://pypi.org/project/promptcov/)): embedding + LLM-judge divergence, the Batches backend, `promptcov check`, teacher-forced multi-turn replay, cross-model `compare`, and Benjamini-Hochberg correction. Still ahead:
 
 - **Per-turn teacher forcing** and tool-call / agentic trajectory replay
 - **Embedding calibration study**: measured (not reasoned) `min_effect` / `sparse_margin` defaults per embedding model
 - **Judge spot-audits** of confidently-significant verdicts, to catch systematic metric bias the borderline band can't see
-- PyPI release
 
 ## The refactoring skill
 
@@ -188,8 +187,8 @@ then `/prompt-refactor` turns "here's my prompt and a week of logs" into a verif
 
 `promptcov/examples/aria_prompt.md` is a fictional support-agent prompt containing: two contradictory greeting rules, a triple-stacked refund rule, a tone section nobody may reopen, a `DO NOT DELETE` line from a departed engineer, a temp fix from last May, and one rule about cheese. The mock provider deterministically simulates a model whose behavior is a pure function of which rules survive — so the demo's verdicts are ground-truth-checkable, and the whole pipeline (stats, probes, negation, rescue, report) runs offline in seconds. `tests/` asserts the verdicts.
 
-Run it. Watch the funeral. Watch the cheese rule get its justice.
+Run it. Watch the cheese rule get its justice.
 
 ---
 
-*promptcov v0.2.0 — MIT licensed, no hard dependencies, Python ≥3.10. Built because every prompt file deserves a coroner, and every rule deserves a trial.*
+*promptcov v0.2.0 — MIT licensed, no hard dependencies, Python ≥3.10. Built because every rule deserves a trial.*
