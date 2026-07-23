@@ -174,6 +174,16 @@ Shipped in 0.2.0: embedding + LLM-judge divergence, the Batches backend, `prompt
 - **Judge spot-audits** of confidently-significant verdicts, to catch systematic metric bias the borderline band can't see
 - PyPI release
 
+## The refactoring skill
+
+`skills/prompt-refactor/SKILL.md` packages the full workflow — segmentation checklist, corpus-engineering rules, the metric/flags decision tree, the verdict interpretation table, and the memo + CI-gate deliverables — as an agent skill. If you use Claude Code:
+
+```bash
+cp -r skills/prompt-refactor ~/.claude/skills/
+```
+
+then `/prompt-refactor` turns "here's my prompt and a week of logs" into a verified smaller prompt with a regression gate, with the statistical judgment calls encoded instead of improvised.
+
 ## The demo, for the record
 
 `promptcov/examples/aria_prompt.md` is a fictional support-agent prompt containing: two contradictory greeting rules, a triple-stacked refund rule, a tone section nobody may reopen, a `DO NOT DELETE` line from a departed engineer, a temp fix from last May, and one rule about cheese. The mock provider deterministically simulates a model whose behavior is a pure function of which rules survive — so the demo's verdicts are ground-truth-checkable, and the whole pipeline (stats, probes, negation, rescue, report) runs offline in seconds. `tests/` asserts the verdicts.
