@@ -281,8 +281,11 @@ class Engine:
             "exhaustive": cfg.exhaustive,
             "temperature": getattr(self.p, "temperature", None),
             "max_tokens": getattr(self.p, "max_tokens", None),
+            "effort": getattr(self.p, "effort", None),
             # run-cost fields — never part of any comparability check
             "provider_calls": self.runner.calls,
+            "truncated": getattr(self.p, "stops", {}).get("max_tokens", 0),
+            "refusals": getattr(self.p, "stops", {}).get("refusal", 0),
             "seconds": round(time.time() - t0, 1),
         }
         return res

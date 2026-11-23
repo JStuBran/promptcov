@@ -32,7 +32,7 @@ EXIT_PASS, EXIT_POLICY, EXIT_INFRA = 0, 1, 3
 # every verdict-affecting config field recorded by the payload contract —
 # a mismatch makes the two reports incomparable (run-cost fields like
 # seconds/provider_calls/inputs are deliberately absent)
-PARITY_FIELDS = ("metric", "model", "temperature", "max_tokens",
+PARITY_FIELDS = ("metric", "model", "temperature", "effort", "max_tokens",
                  "replicates", "negate", "probes", "probe_n",
                  "probe_replicates", "alpha", "min_effect", "correction",
                  "q", "exhaustive", "judge", "judge_model")

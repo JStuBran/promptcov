@@ -4,6 +4,12 @@ AnthropicProvider — the real thing. Requires ANTHROPIC_API_KEY. Uses
 prompt caching (the system prompt is stable across a variant's whole
 corpus sweep, so cache hits cover most of the bill).
 
+Two request surfaces, picked from the model id (see accepts_sampling):
+models up to Claude 4.6 take `temperature` and run without thinking;
+every later model rejects sampling parameters, always thinks, and is
+tuned with `output_config.effort` instead. Thinking shares `max_tokens`
+with the reply, so the budgets here are sized for both.
+
 MockProvider — a deterministic-with-jitter simulator of "Aria", the
 CloudNest support agent. Its behavior is a *function of which rules
 survive in the system prompt it receives*, which lets the entire
@@ -18,7 +24,30 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
+
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+_FAMILY_RE = re.compile(
+    r"claude-(?:opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?=-|$))?")
+
+
+def accepts_sampling(model: str) -> bool:
+    """True for models that still take `temperature` (Claude 4.6 and
+    earlier). Opus 4.7 onward, the Claude 5 family, and Fable/Mythos
+    return a 400 for sampling parameters. An unrecognized id is treated
+    as current: omitting `temperature` is valid on every model, sending
+    it is not."""
+    m = _FAMILY_RE.match(model)
+    if m:
+        return (int(m.group(1)), int(m.group(2) or 0)) <= (4, 6)
+    return bool(re.match(r"claude-[123](?:[-.]|$)", model))
+
+
+class EmptyReply(RuntimeError):
+    """The model spent its whole max_tokens budget before writing any
+    reply text. Not retryable at the same budget."""
 
 
 def retry_request(client, method: str, url: str, body: dict | None = None,
@@ -61,9 +90,10 @@ class AnthropicProvider:
     name = "anthropic"
     batch_enabled = False    # instance-level True under --batch
 
-    def __init__(self, model: str = "claude-sonnet-4-6",
-                 max_tokens: int = 1024, temperature: float = 1.0,
-                 batch: bool = False):
+    def __init__(self, model: str = "claude-sonnet-5-5",
+                 max_tokens: int = 16000,
+                 temperature: float | None = None,
+                 effort: str | None = None, batch: bool = False):
         try:
             import httpx  # lazy: mock mode stays dependency-free
         except ImportError:
@@ -76,19 +106,79 @@ class AnthropicProvider:
             raise RuntimeError(
                 "ANTHROPIC_API_KEY is not set. Export it, or use "
                 "--provider mock to run the offline demo.")
+        if temperature is not None and not accepts_sampling(model):
+            raise SystemExit(
+                f"{model} does not accept --temperature (sampling "
+                f"parameters were removed after Claude 4.6). Drop the "
+                f"flag and set --effort to your production effort level "
+                f"instead.")
+        if effort is not None and effort not in EFFORT_LEVELS:
+            raise SystemExit(
+                f"--effort must be one of {', '.join(EFFORT_LEVELS)}")
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.effort = effort
         self.batch_enabled = batch
+        self._init_stops()
         # name is the cache namespace: outputs are only reusable for the
-        # exact same model + sampling settings
-        self.name = f"anthropic:{model}:t{temperature}:m{max_tokens}"
+        # exact same model + sampling/effort settings
+        self.name = (f"anthropic:{model}:t{temperature}:e{effort}"
+                     f":m{max_tokens}")
+        # thinking models answer slower than the old 120s ceiling allows
         self._client = httpx.Client(
             base_url="https://api.anthropic.com",
             headers={"x-api-key": key,
                      "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            timeout=120.0)
+            timeout=600.0)
+
+    @classmethod
+    def for_judge(cls, model: str) -> "AnthropicProvider":
+        """Judge settings per surface: temperature 0 where the model
+        takes it, otherwise low effort (the closest thing to a pinned
+        setting) with room for thinking ahead of the rubric answer."""
+        if accepts_sampling(model):
+            return cls(model=model, temperature=0.0, max_tokens=400)
+        return cls(model=model, effort="low", max_tokens=4000)
+
+    def _init_stops(self):
+        # replies cut short, counted per run for the operator warning
+        self.stops = {"max_tokens": 0, "refusal": 0}
+        self._stops_lock = threading.Lock()
+
+    def _params(self, user) -> dict:
+        """Completion params shared by the sync and batch paths. No
+        `thinking` field: omitting it is each model's own default, and
+        any explicit value is rejected somewhere in the lineup."""
+        params = {"model": self.model, "max_tokens": self.max_tokens,
+                  "messages": self._messages(user)}
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.effort is not None:
+            params["output_config"] = {"effort": self.effort}
+        return params
+
+    def _reply(self, message: dict) -> str:
+        """Reply text, with cut-short replies made visible instead of
+        scored as if they were complete. A refusal is recorded as a
+        stable marker so it reads as one behavior, not as noise; a reply
+        truncated to nothing is an error, because an empty string would
+        score as a huge fake divergence."""
+        text = self._text(message.get("content", []))
+        stop = message.get("stop_reason")
+        if stop in self.stops:
+            with self._stops_lock:
+                self.stops[stop] += 1
+        if stop == "refusal":
+            category = (message.get("stop_details") or {}).get("category")
+            return f"[refused: {category or 'unspecified'}]"
+        if stop == "max_tokens" and not text.strip():
+            raise EmptyReply(
+                f"{self.model} used all {self.max_tokens} max_tokens "
+                f"before writing any reply (thinking shares that "
+                f"budget) — raise --max-tokens")
+        return text
 
     def _post(self, body: dict) -> dict:
         return self._request("POST", "/v1/messages", body).json()
@@ -101,18 +191,13 @@ class AnthropicProvider:
         return [{"role": r, "content": c} for r, c in user.messages]
 
     def complete(self, system: str, user, run_tag: str = "") -> str:
-        body = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "messages": self._messages(user),
-        }
+        body = self._params(user)
         # the API rejects empty text blocks (judge calls pass "", and a
         # fully-pruned candidate can rebuild to pure whitespace)
         if system.strip():
             body["system"] = [{"type": "text", "text": system,
                                "cache_control": {"type": "ephemeral"}}]
-        return self._text(self._post(body).get("content", []))
+        return self._reply(self._post(body))
 
     # --------------------- Message Batches (50% price) --------------------
     # The same completion params as complete(), submitted asynchronously.
@@ -133,9 +218,7 @@ class AnthropicProvider:
         empty/whitespace — the API rejects empty text blocks, and a
         fully-pruned candidate prompt is a legitimate thing to verify
         (found live: an all-dead prompt crashed the verification batch)."""
-        params = {"model": self.model, "max_tokens": self.max_tokens,
-                  "temperature": self.temperature,
-                  "messages": self._messages(user)}
+        params = self._params(user)
         if system.strip():
             params["system"] = [{"type": "text", "text": system,
                                  "cache_control": {"type": "ephemeral",
@@ -168,8 +251,12 @@ class AnthropicProvider:
             cid, result = rec.get("custom_id"), rec.get("result", {})
             rtype = result.get("type")
             if rtype == "succeeded":
-                content = result.get("message", {}).get("content", [])
-                yield cid, "succeeded", self._text(content)
+                try:
+                    yield cid, "succeeded", self._reply(
+                        result.get("message", {}))
+                except EmptyReply as e:
+                    # resubmitting at the same budget cannot succeed
+                    yield cid, "errored_invalid", str(e)
             elif rtype == "errored":
                 err = result.get("error", {})
                 etype = err.get("error", {}).get("type", err.get("type", ""))
@@ -181,9 +268,19 @@ class AnthropicProvider:
                 yield cid, "retryable", rtype
 
     def _small(self, prompt: str) -> str:
-        data = self._post({"model": self.model, "max_tokens": 400,
-                           "temperature": 0,
-                           "messages": [{"role": "user", "content": prompt}]})
+        """Helper generation (rule inversions, probe inputs). A reply
+        that was refused or cut off returns "" so callers fall back to
+        "no safe negation" / "no probes" instead of using a fragment."""
+        body = {"model": self.model,
+                "messages": [{"role": "user", "content": prompt}]}
+        if accepts_sampling(self.model):
+            body.update(max_tokens=400, temperature=0)
+        else:
+            body.update(max_tokens=4000,
+                        output_config={"effort": "low"})
+        data = self._post(body)
+        if data.get("stop_reason") in ("max_tokens", "refusal"):
+            return ""
         return self._text(data.get("content", []))
 
     def negate_rule(self, rule: str) -> str | None:

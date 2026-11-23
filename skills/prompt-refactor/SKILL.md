@@ -19,7 +19,9 @@ not re-implement any statistics yourself.
 2. **Traffic** — real user messages from logs (strongly preferred) or a
    corpus you will synthesize (Phase 2).
 3. **An Anthropic API key** in `ANTHROPIC_API_KEY` and a small budget.
-   Typical full run on `claude-haiku-4-5` with `--batch`: **$1–5**.
+   A full run on `claude-haiku-4-5` with `--batch` measured **$1–5**;
+   `claude-haiku-5-5` costs less per token but spends some on thinking,
+   so take the call count from `--dry-run` before quoting a figure.
    Mock-provider dry runs and cost estimates are free.
 4. promptcov installed: `pip install 'promptcov[anthropic,embeddings]'`
    (or from the repo: `uv run --extra anthropic --extra embeddings
@@ -71,15 +73,18 @@ When synthesizing, engineer coverage deliberately:
 
 ## Phase 3 — Configuration decision tree
 
-- **Model & temperature: match production.** The noise floor is only a
-  valid null at the deployment settings. Use `claude-haiku-4-5` for a
-  cheap pilot even if production is bigger — then confirm survivors on
-  the production model.
+- **Model & effort: match production.** The noise floor is only a
+  valid null at the deployment settings. On current models that means
+  `--effort` (they reject `--temperature`; promptcov stops before
+  spending anything if you pass it). On Claude 4.6 and earlier it means
+  `--temperature`. Use `claude-haiku-5-5` for a cheap pilot even if
+  production is bigger — then confirm survivors on the production model.
 - **Metric:** start with `--metric embedding` for tone / style /
-  persona / formatting prompts, or any model at temperature ≳0.7.
+  persona / formatting prompts, or any run whose pilot noise floor is
+  high (older models at temperature ≳0.7 are the usual case).
   Case data: on identical cached outputs, a tone-rules prompt had a
   lexical noise floor of **0.752** (blind — nothing can register) vs
-  **0.102** with embeddings. Plain `lexical` is fine for low-temperature,
+  **0.102** with embeddings. Plain `lexical` is fine for low-noise,
   content-heavy prompts where wording changes ARE the signal.
 - **Always pass `--negate --probes`.** Negation separates REDUNDANT
   (guardrail) from dead; probes separate UNEXERCISED (live but dormant)

@@ -15,7 +15,7 @@ import sys
 from .engine import Config, Engine
 from .report import render
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5-5"
 
 
 def _load_corpus(path: str, max_inputs: int | None) -> list:
@@ -60,8 +60,9 @@ def _load_corpus(path: str, max_inputs: int | None) -> list:
     return inputs[:max_inputs] if max_inputs else inputs
 
 
-def _provider(name: str, model: str, temperature: float, max_tokens: int,
-              batch: bool = False):
+def _provider(name: str, model: str, temperature: float | None,
+              max_tokens: int, batch: bool = False,
+              effort: str | None = None):
     if name == "mock":
         from .providers import MockProvider
         # the run-parser default model is an anthropic id; only an
@@ -69,7 +70,8 @@ def _provider(name: str, model: str, temperature: float, max_tokens: int,
         return MockProvider(None if model == DEFAULT_MODEL else model)
     from .providers import AnthropicProvider
     return AnthropicProvider(model=model, temperature=temperature,
-                             max_tokens=max_tokens, batch=batch)
+                             effort=effort, max_tokens=max_tokens,
+                             batch=batch)
 
 
 def _check(ap, args) -> int:
@@ -142,6 +144,8 @@ def _check_run_candidate(baseline: dict, args, out_dir: str) -> str:
         argv += ["--max-inputs", str(m["max_inputs"])]
     if m.get("temperature") is not None:
         argv += ["--temperature", str(m["temperature"])]
+    if m.get("effort") is not None:
+        argv += ["--effort", str(m["effort"])]
     if m.get("max_tokens") is not None:
         argv += ["--max-tokens", str(m["max_tokens"])]
     for flag, key in (("--negate", "negate"), ("--probes", "probes"),
@@ -279,19 +283,27 @@ def main(argv: list[str] | None = None) -> int:
                           "(more = stronger UNEXERCISED verdicts)")
     run.add_argument("--judge", action="store_true",
                      help="LLM second opinion on borderline verdicts "
-                          "(reference-based 0-3 rubric, temperature 0)")
-    run.add_argument("--judge-model", default="claude-haiku-4-5",
+                          "(reference-based 0-3 rubric; temperature 0, "
+                          "or low effort on models without temperature)")
+    run.add_argument("--judge-model", default="claude-haiku-5-5",
                      help="model for --judge; judging is high-volume, "
                           "so a cheap model is the right default")
     run.add_argument("--min-effect", type=float, default=None,
                      help="minimum-effect gate; defaults to the selected "
                           "metric's calibrated value (0.02 for lexical)")
     run.add_argument("--max-inputs", type=int, default=None)
-    run.add_argument("--temperature", type=float, default=1.0,
+    run.add_argument("--effort", default=None,
+                     choices=["low", "medium", "high", "xhigh", "max"],
                      help="MATCH YOUR PRODUCTION SETTING — the noise floor "
-                          "is only valid at the temperature you deploy at")
-    run.add_argument("--max-tokens", type=int, default=1024,
-                     help="raise if your agent's responses run long; "
+                          "is only valid at the effort you deploy at "
+                          "(default: the model's own default)")
+    run.add_argument("--temperature", type=float, default=None,
+                     help="Claude 4.6 and earlier only — later models "
+                          "reject it; match your production setting "
+                          "(default: the API default)")
+    run.add_argument("--max-tokens", type=int, default=16000,
+                     help="shared by thinking and the reply; raise if "
+                          "the run reports truncated replies — "
                           "truncation reads as fake divergence")
     run.add_argument("--concurrency", type=int, default=8)
     run.add_argument("--batch", action="store_true",
@@ -347,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                           "--models)")
     cmp.add_argument("--models", default=None,
                      help="comma-separated pair, e.g. "
-                          "'claude-sonnet-4-6,claude-haiku-4-5' — runs "
+                          "'claude-sonnet-5-5,claude-sonnet-4-6' — runs "
                           "the analysis once per model, then compares")
     cmp.add_argument("--prompt", default=None)
     cmp.add_argument("--corpus", default=None)
@@ -464,13 +476,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.judge:
         from .judge import Judge
         from .providers import AnthropicProvider
-        judge = Judge(AnthropicProvider(model=args.judge_model,
-                                        temperature=0.0, max_tokens=400),
+        judge = Judge(AnthropicProvider.for_judge(args.judge_model),
                       cache_dir=args.cache_dir)
 
     engine = Engine(_provider(args.provider, args.model,
                               args.temperature, args.max_tokens,
-                              batch=args.batch), cfg,
+                              batch=args.batch, effort=args.effort), cfg,
                     cache_dir=args.cache_dir, metric=metric, judge=judge)
     engine.runner.no_wait = args.no_wait
     from .runner import BatchPending
@@ -482,6 +493,19 @@ def main(argv: list[str] | None = None) -> int:
         print("● results are retained for 29 days — rerun this exact "
               "command to poll, merge, and continue", file=sys.stderr)
         return 0
+
+    # cached replies are not recounted, so this reports new calls only
+    cut, refused = res.meta["truncated"], res.meta["refusals"]
+    if cut:
+        print(f"warning: {cut} replies hit --max-tokens "
+              f"({args.max_tokens}) and were cut off — truncation reads "
+              f"as fake divergence; raise --max-tokens and rerun with a "
+              f"fresh --cache-dir", file=sys.stderr)
+    if refused:
+        print(f"warning: {refused} replies were refusals, scored as a "
+              f"fixed '[refused: …]' marker — check that the corpus "
+              f"reflects traffic the model actually answers",
+              file=sys.stderr)
 
     html = render(res, title=os.path.basename(args.prompt))
     with open(args.out, "w") as fh:

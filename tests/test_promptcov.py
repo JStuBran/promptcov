@@ -808,7 +808,10 @@ class _ScriptedHTTP:
 def _bare_anthropic(client):
     from promptcov.providers import AnthropicProvider
     p = AnthropicProvider.__new__(AnthropicProvider)
-    p.model, p.max_tokens, p.temperature = "test-model", 64, 1.0
+    # a pre-4.7 id: the legacy surface, where temperature is still sent
+    p.model, p.max_tokens, p.temperature = "claude-sonnet-4-6", 64, 1.0
+    p.effort = None
+    p._init_stops()
     p.batch_enabled = True
     p._client = client
     return p
@@ -1475,3 +1478,162 @@ def test_prune_verification_rescue():
     assert res.verification["rescued"]
     survivors = [w for w in ("alpha", "beta") if w in res.pruned_prompt]
     assert len(survivors) == 1
+
+
+# ------------------------- v0.3: current-model surface -------------------
+
+def _current_anthropic(client, effort=None, max_tokens=64):
+    p = _bare_anthropic(client)
+    p.model, p.temperature, p.effort = "claude-sonnet-5-5", None, effort
+    p.max_tokens = max_tokens
+    return p
+
+
+def _msg(text="", stop="end_turn", **extra):
+    content = [{"type": "thinking", "thinking": ""}]
+    if text:
+        content.append({"type": "text", "text": text})
+    return _Resp(200, {"content": content, "stop_reason": stop, **extra})
+
+
+def test_accepts_sampling_by_model_generation():
+    from promptcov.providers import accepts_sampling
+    for legacy in ("claude-sonnet-4-6", "claude-opus-4-6",
+                   "claude-haiku-4-5", "claude-opus-4-1-20250805",
+                   "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"):
+        assert accepts_sampling(legacy), legacy
+    for current in ("claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5",
+                    "claude-sonnet-5-5", "claude-opus-5-5",
+                    "claude-haiku-5-5", "claude-fable-5-2",
+                    "some-future-model"):
+        assert not accepts_sampling(current), current
+
+
+def test_current_model_request_has_no_sampling_params():
+    client = _ScriptedHTTP([_msg("hi"), _msg("hi")])
+    p = _current_anthropic(client)
+    assert p.complete("SYS", "hello") == "hi"
+    body = client.calls[0][2]
+    assert "temperature" not in body and "output_config" not in body
+    assert "thinking" not in body
+    p.effort = "medium"
+    p.complete("SYS", "hello")
+    assert client.calls[1][2]["output_config"] == {"effort": "medium"}
+    # the batch path builds from the same params
+    assert p._batch_params("SYS", "hello")["output_config"] == {
+        "effort": "medium"}
+    assert "temperature" not in p._batch_params("SYS", "hello")
+
+
+def test_legacy_model_request_keeps_temperature():
+    client = _ScriptedHTTP([_msg("hi")])
+    p = _bare_anthropic(client)
+    p.complete("SYS", "hello")
+    assert client.calls[0][2]["temperature"] == 1.0
+
+
+def test_temperature_rejected_up_front_on_current_models(monkeypatch):
+    pytest.importorskip("httpx")
+    from promptcov.providers import AnthropicProvider
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    with pytest.raises(SystemExit, match="does not accept --temperature"):
+        AnthropicProvider(model="claude-sonnet-5-5", temperature=0.3)
+    with pytest.raises(SystemExit, match="--effort must be one of"):
+        AnthropicProvider(model="claude-sonnet-5-5", effort="extreme")
+    a = AnthropicProvider(model="claude-sonnet-5-5", effort="low")
+    b = AnthropicProvider(model="claude-sonnet-5-5", effort="high")
+    assert a.name != b.name  # effort must never share cache entries
+    legacy = AnthropicProvider(model="claude-sonnet-4-6", temperature=0.3)
+    assert legacy.temperature == 0.3
+
+
+def test_judge_settings_follow_the_model_surface(monkeypatch):
+    pytest.importorskip("httpx")
+    from promptcov.providers import AnthropicProvider
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    new = AnthropicProvider.for_judge("claude-haiku-5-5")
+    assert (new.temperature, new.effort, new.max_tokens) == (
+        None, "low", 4000)
+    old = AnthropicProvider.for_judge("claude-haiku-4-5")
+    assert (old.temperature, old.effort, old.max_tokens) == (0.0, None, 400)
+
+
+def test_truncated_and_refused_replies_are_not_scored_as_normal():
+    from promptcov.providers import EmptyReply
+    client = _ScriptedHTTP([
+        _msg("partial ans", stop="max_tokens"),
+        _msg("", stop="max_tokens"),
+        _msg("I can't", stop="refusal",
+             stop_details={"type": "refusal", "category": "cyber"}),
+        _msg("", stop="refusal"),
+    ])
+    p = _current_anthropic(client)
+    # partial text is kept but counted, so the run can warn
+    assert p.complete("SYS", "a") == "partial ans"
+    # thinking ate the whole budget: an error, never an empty reply
+    with pytest.raises(EmptyReply, match="raise --max-tokens"):
+        p.complete("SYS", "b")
+    # refusals collapse to one stable marker per category
+    assert p.complete("SYS", "c") == "[refused: cyber]"
+    assert p.complete("SYS", "d") == "[refused: unspecified]"
+    assert p.stops == {"max_tokens": 2, "refusal": 2}
+
+
+def test_batch_empty_truncation_is_not_resubmitted():
+    results_jsonl = "\n".join([
+        json.dumps({"custom_id": "ok", "result": {
+            "type": "succeeded", "message": {
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "fine"}]}}}),
+        json.dumps({"custom_id": "cut", "result": {
+            "type": "succeeded", "message": {
+                "stop_reason": "max_tokens",
+                "content": [{"type": "thinking", "thinking": ""}]}}}),
+    ])
+    client = _ScriptedHTTP([
+        _Resp(200, {"processing_status": "ended",
+                    "results_url": "https://api/results/x"}),
+        _Resp(200, None, text=results_jsonl),
+    ])
+    p = _current_anthropic(client)
+    kinds = {cid: kind for cid, kind, _ in p.batch_results("b")}
+    assert kinds == {"ok": "succeeded", "cut": "errored_invalid"}
+
+
+def test_helper_calls_use_effort_and_drop_cut_off_output():
+    client = _ScriptedHTTP([
+        _msg("Always greet by name."),
+        _msg('["half a js', stop="max_tokens"),
+        _msg("", stop="refusal"),
+    ])
+    p = _current_anthropic(client)
+    assert p.negate_rule("Never greet by name.") == "Always greet by name."
+    body = client.calls[0][2]
+    assert body["output_config"] == {"effort": "low"}
+    assert body["max_tokens"] == 4000 and "temperature" not in body
+    # a truncated probe list or a refused inversion degrades to "none"
+    assert p.generate_probes("rule") == []
+    assert p.negate_rule("rule") is None
+    # legacy models keep the pinned temperature-0 helper call
+    legacy_client = _ScriptedHTTP([_msg("x")])
+    _bare_anthropic(legacy_client).negate_rule("rule")
+    legacy_body = legacy_client.calls[0][2]
+    assert legacy_body["temperature"] == 0 and (
+        "output_config" not in legacy_body)
+
+
+def test_effort_is_a_parity_field_and_recorded(tmp_path):
+    from promptcov.check import PARITY_FIELDS
+    from promptcov.cli import main
+    from promptcov.compare import COMPARE_PARITY
+    assert "effort" in PARITY_FIELDS and "effort" in COMPARE_PARITY
+    prompt = os.path.join(EXAMPLES, "aria_prompt.md")
+    corpus = os.path.join(EXAMPLES, "traffic.jsonl")
+    out = str(tmp_path / "r.html")
+    assert main(["run", "--prompt", prompt, "--corpus", corpus,
+                 "--provider", "mock", "--max-inputs", "8", "--quiet",
+                 "--out", out, "--pruned-out", str(tmp_path / "p.md"),
+                 "--cache-dir", str(tmp_path / "c")]) == 0
+    meta = json.load(open(str(tmp_path / "r.json")))["meta"]
+    assert meta["effort"] is None
+    assert (meta["truncated"], meta["refusals"]) == (0, 0)

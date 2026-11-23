@@ -16,7 +16,8 @@ reachable:
   * sparse tail_hits in {1, 2}                        (either direction)
 
 Judging practice per the literature: coarse scale (LLMs cluster on round
-numbers), justification before score, temperature 0, pair order
+numbers), justification before score, temperature 0 (low effort on
+models that no longer take temperature), pair order
 randomized per item (seeded — the question is symmetric, so
 randomization suffices for position bias). The judge never silently
 overwrites: the segment note carries both signals.
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from . import stats as st
 from .runner import Runner
 
-DEFAULT_JUDGE_MODEL = "claude-haiku-4-5"
+DEFAULT_JUDGE_MODEL = "claude-haiku-5-5"
 MAX_PAIRS = 6                  # judged pairs per borderline leaf
 
 _SCORE_RE = re.compile(r"SCORE:\s*([0-3])")
@@ -89,7 +90,7 @@ class JudgeResult:
 
 
 class Judge:
-    """Wraps a completion provider (temperature-0, small max_tokens) with
+    """Wraps a completion provider (AnthropicProvider.for_judge settings) with
     the Runner cache. The provider's `name` embeds its model and sampling
     config, so swapping --judge-model on a warm cache triggers fresh
     judge calls instead of silently reusing another model's scores."""

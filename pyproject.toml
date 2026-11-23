@@ -1,6 +1,6 @@
 [project]
 name = "promptcov"
-version = "0.2.0"
+version = "0.3.0"
 description = "Coverage analysis for system prompts: which rules are load-bearing, which are decorative fossils"
 readme = "README.md"
 license = {text = "MIT"}
