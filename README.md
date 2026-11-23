@@ -43,7 +43,8 @@ promptcov run \
   --prompt system_prompt.md \
   --corpus traffic.jsonl \
   --provider anthropic \
-  --model claude-sonnet-4-6 \
+  --model claude-sonnet-5-5 \
+  --effort medium \
   --negate --probes \
   --out report.html \
   --pruned-out system_prompt.pruned.md
@@ -67,14 +68,15 @@ promptcov run \
 | `--probe-n N` | Probe inputs per rule (default 4). More probes = stronger `UNEXERCISED` verdicts, more calls |
 | `--probe-replicates N` | Baseline replicates behind the probe noise floor (default 3) |
 | `--metric embedding` | Semantic divergence via static embeddings — local (`pip install 'promptcov[embeddings]'`, offline model2vec) or API (`--embedding-api voyage\|openai`). Lexical catches wording/format drift; embeddings catch paraphrase-vs-semantic change |
-| `--judge` | LLM second opinion on borderline verdicts only (0–3 rubric, temperature 0, `--judge-model` defaults to a cheap model). Both signals are always recorded — the judge never silently overwrites |
+| `--judge` | LLM second opinion on borderline verdicts only (0–3 rubric, `--judge-model` defaults to `claude-haiku-5-5`; temperature 0 on models that take it, low effort otherwise). Both signals are always recorded — the judge never silently overwrites |
 | `--correction bh\|bonferroni\|none` | Multiple-comparisons correction over the leaf-deletion family (default Benjamini-Hochberg at `--q 0.10`). Reports show raw p and adjusted q side by side |
 | `--batch` | Runs the corpus sweeps through the Anthropic Message Batches API at 50% price. Safe to Ctrl-C — rerunning resumes in-flight batches from a manifest. `--no-wait` submits and exits |
 | `--exhaustive` | Tests every leaf even inside sections that showed no section-level effect (slower, catches cancellation — see Limitations) |
 | `--replicates N` | Baseline replicates for the noise floor (default 3; more = tighter floor) |
 | `--max-inputs N` | Cap corpus size for a cheap first pass |
-| `--temperature T` | **Match your production setting.** The noise floor is only a valid null at the temperature you actually deploy at |
-| `--max-tokens N` | Raise if your agent's replies run long — truncation reads as fake divergence |
+| `--effort LEVEL` | **Match your production setting.** `low`/`medium`/`high`/`xhigh`/`max`. On current models effort is what moves output variability and depth, so the noise floor is only a valid null at the effort you deploy at. Omitted = the model's own default (which differs by model — set it explicitly) |
+| `--temperature T` | Claude 4.6 and earlier only; later models reject sampling parameters and promptcov stops before spending anything. Same rule: match production |
+| `--max-tokens N` | Default 16000. Thinking and the reply share this budget. The run warns when replies were cut off — truncation reads as fake divergence |
 | `--dry-run` | Print segmentation + call estimate, make zero model calls |
 | `--concurrency N` | Parallel requests (default 8; lower it if you're rate-limited) |
 
@@ -91,11 +93,11 @@ Fails the build (exit 1) when a prompt edit deletes a `LOAD_BEARING` rule; warns
 ### Cross-model comparison
 
 ```bash
-promptcov compare --models claude-sonnet-4-6,claude-haiku-4-5 \
+promptcov compare --models claude-sonnet-4-6,claude-sonnet-5-5 \
   --prompt system_prompt.md --corpus traffic.jsonl --negate --probes
 ```
 
-Which rules are load-bearing on Sonnet but dead on Haiku? Verdict-level only, by design — each verdict is relative to its own model's noise floor, and effect sizes are never compared across models. Also accepts two pre-generated report JSONs (same prompt + corpus + config enforced, different models required).
+Which rules were load-bearing on the model you are migrating from but are dead on the one you are migrating to? Newer models follow instructions more literally, so rules written to shout at an older model are the usual casualties. Verdict-level only, by design — each verdict is relative to its own model's noise floor, and effect sizes are never compared across models. Also accepts two pre-generated report JSONs (same prompt + corpus + config enforced, different models required).
 
 ### Multi-turn traces
 
@@ -106,6 +108,19 @@ Which rules are load-bearing on Sonnet but dead on Haiku? Verdict-level only, by
 ```
 
 Corpus rows can be recorded conversations: prior turns replay verbatim (teacher-forced) and only the final assistant turn is regenerated under each ablated prompt — one score per row, statistics unchanged. Mixed single/multi-turn corpora are fine. Traces must alternate roles, start and end on a user turn, and contain no `system` role (the prompt file *is* the system prompt).
+
+### Model support
+
+promptcov picks the request shape from the model id:
+
+| Models | What promptcov sends |
+|---|---|
+| Opus 4.7 and later, the Claude 5 family, Fable | No sampling parameters. `output_config.effort` when you pass `--effort`. Thinking is left at the model's default (always on for most of these) |
+| Claude 4.6 and earlier | `temperature` when you pass `--temperature`; no thinking |
+
+Replies that stop early are never scored as ordinary text. A refusal is recorded as a fixed `[refused: <category>]` marker, so a rule whose removal makes the model refuse shows up as one consistent behavior. A reply cut off at `--max-tokens` is counted and reported at the end of the run; one cut off before any text at all stops the run with the fix. Both counts are in the report JSON (`truncated`, `refusals`).
+
+Server-side refusal fallbacks are deliberately not used: a fallback answers from a different model, which would mix two models into one noise floor.
 
 ### Pilot checklist for your first real prompt
 
@@ -158,6 +173,7 @@ Read this before you paste the report into a PR.
 - **The lexical metric is still the default.** It catches wording, structure, and content shifts; it can miss pure *semantic* changes hiding under similar wording, and it can over-weight harmless rephrasings. `--metric embedding` and `--judge` exist for exactly this — but embedding-scale calibration constants are reasoned defaults, not measured ones; sanity-check borderline verdicts against a recorded corpus before trusting them.
 - **Section-level cancellation.** Two contradictory rules in one section can cancel to near-zero *mean* effect when the whole section is ablated. The engine mitigates this by recursing on the permutation p-value alone (not just effect size), but pathological cases exist — `--exhaustive` is the guaranteed-complete mode.
 - **Final-turn replay only.** Multi-turn traces regenerate the last assistant turn; per-turn teacher forcing, tool-call trajectories, and agentic loops are not yet replayed.
+- **No pinned sampling on current models.** With temperature gone, the judge and the negation/probe helpers run at low effort instead of temperature 0. They are cached, so a rerun reproduces them, but a fresh cache can draw a different inversion or probe set.
 - **Negation is heuristic** for the mock and pattern-based fallbacks; the Anthropic provider asks the model to write the inversion, which is better but not infallible. A failed negation degrades gracefully to "no safe negation form."
 - **The null is approximate.** Variant scores are per-input *means over R baseline replicates*, while noise-floor entries are *single pairwise* divergences that share replicates and inputs — same mean under the null, but not the i.i.d. exchangeability a permutation test formally assumes. Mean-difference permutation is robust to this in practice, but the p-values are honest approximations, not exact.
 - **Correction covers the deletion family only.** Each leaf's deciding p (dense/sparse channel minimum, factor-2 adjusted) gets Benjamini-Hochberg by default; the section-recursion gate and the negate/probe cascade deliberately stay at raw alpha (search heuristic and follow-up family respectively). `--correction none` reproduces v0.1's deletion decisions exactly; probe verdicts additionally need `--probe-replicates 2` to match v0.1's hardcoded 2-replicate probe floor.
@@ -167,9 +183,11 @@ Read this before you paste the report into a PR.
 
 ## Roadmap
 
-Shipped in 0.2.0 (on [PyPI](https://pypi.org/project/promptcov/)): embedding + LLM-judge divergence, the Batches backend, `promptcov check`, teacher-forced multi-turn replay, cross-model `compare`, and Benjamini-Hochberg correction. Still ahead:
+Shipped in 0.3.0: support for current Claude models (effort in place of temperature, thinking-sized token budgets, refusal and truncation handling) with `claude-sonnet-5-5` and `claude-haiku-5-5` as the defaults. `effort` joins the report's comparability contract; 0.2 reports stay readable, and `check --run` replays whatever the baseline recorded.
 
-- **Per-turn teacher forcing** and tool-call / agentic trajectory replay
+Shipped in 0.2.0: embedding + LLM-judge divergence, the Batches backend, `promptcov check`, teacher-forced multi-turn replay, cross-model `compare`, and Benjamini-Hochberg correction. Still ahead:
+
+- **Per-turn teacher forcing** and tool-call / agentic trajectory replay, including ablating tool descriptions, not only the system prompt
 - **Embedding calibration study**: measured (not reasoned) `min_effect` / `sparse_margin` defaults per embedding model
 - **Judge spot-audits** of confidently-significant verdicts, to catch systematic metric bias the borderline band can't see
 
@@ -191,4 +209,4 @@ Run it. Watch the cheese rule get its justice.
 
 ---
 
-*promptcov v0.2.0 — MIT licensed, no hard dependencies, Python ≥3.10. Built because every rule deserves a trial.*
+*promptcov v0.3.0 — MIT licensed, no hard dependencies, Python ≥3.10. Built because every rule deserves a trial.*
